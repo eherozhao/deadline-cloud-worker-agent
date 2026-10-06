@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from concurrent.futures import Executor
-from typing import Any, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING, cast
 
 from openjd.model import TaskParameterSet
 
@@ -10,8 +10,48 @@ from ...log_messages import SessionActionLogKind
 from .openjd_action import OpenjdAction
 
 if TYPE_CHECKING:
+    from openjd.model.v2023_09 import StepScript, StepTemplate
+
     from ..job_entities import StepDetails
     from ..session import Session
+
+
+def _resolve_step_script(step_template: StepTemplate) -> StepScript:
+    """Pick the StepScript to run.
+
+    The step template arrives un-instantiated, in either of two shapes.
+
+    A `script:` template already carries the script to run, in
+    `StepTemplate.script`.
+
+    A FEATURE_BUNDLE_1 simple-action template (`bash:`, `cmd:`, `node:`,
+    `powershell:`, `python:`) has no `script` at all. The service serves the
+    sugar as authored and the worker never instantiates a job, so nothing
+    de-sugars it. `resolve_syntax_sugar()` does that here, synthesizing a
+    runnable `script` from the sugar. Under openjd-model >=0.11.9 the produced
+    `script.let` carries only the simple-action's own `let`; step-scope `let` is
+    no longer folded in.
+
+    Step-scope `let` values reach the session through the resolved symbol table
+    the service serves. For a `script:` template that is the only channel, and
+    the source expressions are never re-evaluated here.
+
+    The same is now true of the sugar path: step-scope bindings travel
+    exclusively through the service-served `resolvedSymbolTable`, not through
+    the fold, so those names no longer arrive twice. The fold synthesizes the
+    script structure and carries only the simple-action `let`, which leaves the
+    resolved symbol table as the single channel for step-scope bindings on both
+    paths.
+    """
+    script = step_template.script
+    if script is not None:
+        return script
+
+    # The model rejects a StepTemplate carrying neither `script` nor a simple
+    # action, so the fold always produces a script. The cast records that
+    # invariant for the type checker; it is not a runtime conversion.
+    folded = step_template.resolve_syntax_sugar()
+    return cast("StepScript", folded.script)
 
 
 class RunStepTaskAction(OpenjdAction):
@@ -25,13 +65,13 @@ class RunStepTaskAction(OpenjdAction):
         The unique step identifier
     details : StepDetails
         The environment details
-    task_id : str
+    task_id : Optional[str]
         The unique task identifier
     task_parameter_values : TaskParameterSet
         The task parameter values
     """
 
-    task_id: str
+    task_id: Optional[str]
     _details: StepDetails
     _task_parameter_values: TaskParameterSet
 
@@ -40,7 +80,7 @@ class RunStepTaskAction(OpenjdAction):
         *,
         id: str,
         details: StepDetails,
-        task_id: str,
+        task_id: Optional[str] = None,
         task_parameter_values: TaskParameterSet,
     ) -> None:
         super(RunStepTaskAction, self).__init__(
@@ -70,8 +110,20 @@ class RunStepTaskAction(OpenjdAction):
         executor : Executor
             An executor for running futures
         """
+        env_vars = {
+            "DEADLINE_STEP_ID": self._details.step_id,
+            "DEADLINE_SESSIONACTION_ID": self._id,
+        }
+        if self.task_id is not None:
+            env_vars["DEADLINE_TASK_ID"] = self.task_id
+
+        step_template = self._details.step_template
+        step_script = _resolve_step_script(step_template)
+
         session.run_task(
-            step_script=self._details.step_template.script,
+            step_script=step_script,
             task_parameter_values=self._task_parameter_values,
-            os_env_vars={"DEADLINE_SESSIONACTION_ID": self._id, "DEADLINE_TASK_ID": self.task_id},
+            os_env_vars=env_vars,
+            step_name=step_template.name,
+            resolved_symbol_table_json=self._details.resolved_symbol_table_json,
         )

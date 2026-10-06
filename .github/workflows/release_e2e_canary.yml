@@ -2,27 +2,33 @@ name: Release Canary
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 jobs:
-  WindowsIntegrationTests:
-    name: Windows Integration Tests
-    runs-on: windows-latest
+  IntegrationTests:
+    name: Integration Tests
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     strategy:
       matrix:
-        python-version: ['3.9', '3.10', '3.11']
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
     steps:
-    - uses: actions/checkout@v4
-    
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ matrix.python-version }}
+
     - name: Install Hatch
       run: |
-        pip install --upgrade hatch
+        pip install --upgrade hatch 'virtualenv<21; python_version < "3.10"'
 
-    - name: Run Windows Integration Tests
-      run: hatch run windows-integ-test
+    - name: Run Integration Tests
+      run: hatch run integ-test
       
   ReleaseLinuxE2ECanary:
     name: Release Linux Canary
@@ -36,6 +42,8 @@ jobs:
       branch: release
       environment: canary
       os: linux
+    concurrency:
+      group: releaselinuxe2ecanary
 
   ReleaseWindowsE2ECanary:
     name: Release Windows Canary
@@ -49,3 +57,5 @@ jobs:
       branch: release
       environment: canary
       os: windows
+    concurrency:
+      group: releasewindowse2ecanary

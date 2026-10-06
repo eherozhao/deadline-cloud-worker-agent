@@ -10,15 +10,24 @@ import logging
 import pytest
 import os
 
-from deadline_test_fixtures import CommandResult, DeadlineWorkerConfiguration, EC2InstanceWorker
+from deadline_test_fixtures import (
+    CommandResult,
+    DeadlineClient,
+    DeadlineWorkerConfiguration,
+    EC2InstanceWorker,
+    Job,
+    TaskStatus,
+)
+
+from .conftest import DeadlineResources
+from .utils import job_failure_message
 
 
 @pytest.mark.skipif(
     os.environ["OPERATING_SYSTEM"] == "windows",
     reason="Linux specific test",
 )
-@pytest.mark.parametrize("operating_system", ["linux"], indirect=True)
-def test_access_worker_credential_file_from_job(
+def test_access_worker_credential_file_from_job_linux(
     session_worker: EC2InstanceWorker,
     worker_config: DeadlineWorkerConfiguration,
 ) -> None:
@@ -54,6 +63,86 @@ def test_access_worker_credential_file_from_job(
 
     # THEN
     assert result.exit_code != 0
+
+
+@pytest.mark.skipif(
+    os.environ["OPERATING_SYSTEM"] != "windows",
+    reason="Windows specific test",
+)
+def test_access_worker_credential_file_from_job_windows(
+    session_worker: EC2InstanceWorker,
+    deadline_resources: DeadlineResources,
+    deadline_client: DeadlineClient,
+) -> None:
+    # GIVEN
+    # This script attempts to read worker credential files.
+    # EXPECTED: access is denied → script exits 1 → job FAILS.
+    # If access is NOT denied, the script exits 0 → job SUCCEEDS → test assertion catches the bug.
+    powershell_script = """
+Write-Host "--- Attempting to read worker credential files as job user ---"
+Write-Host "Current user: $(whoami)"
+
+try {
+    $credFiles = Get-ChildItem -Path "$env:ProgramData\\Amazon\\Deadline\\Cache\\credentials" -Filter *.json -ErrorAction Stop
+    if ($credFiles) {
+        foreach ($file in $credFiles) {
+            $content = Get-Content $file.FullName -ErrorAction Stop
+            Write-Host "Read credential file: $($file.FullName) — access was NOT denied"
+        }
+    } else {
+        Write-Host "No credential files found"
+        exit 1
+    }
+} catch {
+    Write-Host "PASS: Access denied as expected — $_"
+    exit 1
+}
+
+# If we reach here, the job user could read credentials — this is a security bug.
+Write-Host "FAIL: Job user was able to read worker credentials"
+"""
+    # WHEN
+    job: Job = Job.submit(
+        client=deadline_client,
+        farm=deadline_resources.farm,
+        queue=deadline_resources.queue_a,
+        priority=98,
+        max_retries_per_task=0,
+        template={
+            "specificationVersion": "jobtemplate-2023-09",
+            "name": "Windows Worker Credentials Read Test",
+            "description": "Verifies job user cannot read worker credential files. Expected status: FAILED",
+            "steps": [
+                {
+                    "name": "Read Windows Worker Credentials",
+                    "script": {
+                        "embeddedFiles": [
+                            {
+                                "name": "read_credentials",
+                                "type": "TEXT",
+                                "filename": "read_credentials.ps1",
+                                "data": powershell_script,
+                            },
+                        ],
+                        "actions": {
+                            "onRun": {
+                                "command": "powershell",
+                                "args": ["-File", "{{Task.File.read_credentials}}"],
+                            },
+                        },
+                    },
+                },
+            ],
+        },
+    )
+    # Wait until the job is completed
+    job.wait_until_complete(client=deadline_client)
+
+    # THEN
+    assert job.task_run_status == TaskStatus.FAILED, (
+        "Job should have failed when trying to access worker credentials.\n"
+        + job_failure_message(job, deadline_client, deadline_resources.queue_a, deadline_resources)
+    )
 
 
 def expect_ssm_success(

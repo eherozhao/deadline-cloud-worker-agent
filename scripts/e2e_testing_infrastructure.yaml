@@ -8,20 +8,20 @@ Description: Infrastructure for running the Deadline Cloud Worker Agent end-to-e
 
 Outputs:
   Account:
-    Value: !Sub '${AWS::AccountId}'
+    Value: !Sub "${AWS::AccountId}"
 
   Region:
-    Value: !Sub '${AWS::Region}'
-    
+    Value: !Sub "${AWS::Region}"
+
   SubnetId:
     Value: !GetAtt [PublicSubnet, SubnetId]
-  
+
   SecurityGroupId:
     Value: !GetAtt [SecurityGroup, GroupId]
-  
+
   FixturesBucketName:
     Value: !Ref FixturesBootstrapBucket
-  
+
   JobAttachmentsBucket:
     Value: !Ref JobAttachmentsBucket
 
@@ -36,7 +36,7 @@ Outputs:
 
   WindowsHostRoleArn:
     Value: !GetAtt [WindowsHostRole, Arn]
-  
+
   LinuxWorkerInstanceProfileName:
     Value: !Sub DeadlineCloudAgent-E2E-LinuxHostRole-${AWS::Region}-InstanceProfile
 
@@ -45,7 +45,7 @@ Outputs:
 
   CodeArtifactDomainName:
     Value: !GetAtt [CodeArtifactPyPIMirrorRepo, DomainName]
-  
+
   CodeArtifactRepositoryName:
     Value: !GetAtt [CodeArtifactPyPIMirrorRepo, Name]
 
@@ -54,13 +54,16 @@ Outputs:
 
   QueueAId:
     Value: !GetAtt [MainQueue, QueueId]
-  
+
   QueueBId:
     Value: !GetAtt [SecondaryQueue, QueueId]
-  
+
+  JobsRunAsAgentUserQueueId:
+    Value: !GetAtt [JobsRunAsAgentUserQueue, QueueId]
+
   NonValidRoleQueueId:
     Value: !GetAtt [NonValidRoleQueue, QueueId]
-  
+
   ScalingQueueId:
     Value: !GetAtt [AutoscalingQueue, QueueId]
 
@@ -79,9 +82,19 @@ Outputs:
   WindowsAutoFleetX86Id:
     Value: !GetAtt [WindowsAutoScalingFleetx86, FleetId]
 
+  LinuxJobStorageProfileId:
+    Value: !GetAtt [LinuxJobStorageProfile, StorageProfileId]
+
+  LinuxFleetStorageProfileId:
+    Value: !GetAtt [LinuxFleetStorageProfile, StorageProfileId]
+
+  WindowsJobStorageProfileId:
+    Value: !GetAtt [WindowsJobStorageProfile, StorageProfileId]
+
+  WindowsFleetStorageProfileId:
+    Value: !GetAtt [WindowsFleetStorageProfile, StorageProfileId]
 
 Resources:
-
   # --------------------------
   # Networking infrastructure
   # --------------------------
@@ -148,14 +161,15 @@ Resources:
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for hosts in Deadline Cloud Agent E2E testing
+      GroupDescription:
+        Security group for hosts in Deadline Cloud Agent E2E testing
         infrastructure.
       GroupName: DeadlineCloudAgentE2ETest
       VpcId: !Ref VPC
       SecurityGroupEgress:
         - Description: Allow all outbound traffic
           CidrIp: 0.0.0.0/0
-          IpProtocol: '-1'
+          IpProtocol: "-1"
         # No inbound traffic allowed
       Tags:
         - Key: Name
@@ -226,7 +240,7 @@ Resources:
     Properties:
       Bucket: !Ref FixturesBootstrapBucket
       PolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Action: s3:*
             Condition:
@@ -234,11 +248,11 @@ Resources:
                 aws:SecureTransport: false
             Effect: Deny
             Principal:
-              AWS: '*'
+              AWS: "*"
             Resource:
               - !GetAtt FixturesBootstrapBucket.Arn
               - !Join
-                - ''
+                - ""
                 - - !GetAtt FixturesBootstrapBucket.Arn
                   - /*
 
@@ -276,7 +290,7 @@ Resources:
     Properties:
       Bucket: !Ref JobAttachmentsBucket
       PolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Action: s3:*
             Condition:
@@ -284,11 +298,11 @@ Resources:
                 aws:SecureTransport: false
             Effect: Deny
             Principal:
-              AWS: '*'
+              AWS: "*"
             Resource:
               - !GetAtt JobAttachmentsBucket.Arn
               - !Join
-                - ''
+                - ""
                 - - !GetAtt JobAttachmentsBucket.Arn
                   - /*
 
@@ -307,7 +321,7 @@ Resources:
       RoleName: !Sub DeadlineCloudAgent-E2E-LinuxHostRole-${AWS::Region}
       Description: Instance role for worker hosts running Linux
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -318,7 +332,7 @@ Resources:
       Policies:
         - PolicyName: TestFixturesBootstrapping
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
@@ -326,7 +340,7 @@ Resources:
                   - s3:GetObject
                 Resource:
                   - !Join
-                    - ''
+                    - ""
                     - - !GetAtt FixturesBootstrapBucket.Arn
                       - /*
               - Effect: Allow
@@ -338,7 +352,7 @@ Resources:
                 Action:
                   - sts:GetServiceBearerToken
                 Resource:
-                  - '*'
+                  - "*"
               - Effect: Allow
                 Action:
                   - codeartifact:ReadFromRepository
@@ -366,7 +380,7 @@ Resources:
       RoleName: !Sub DeadlineCloudAgent-E2E-LinuxFleetRole-${AWS::Region}
       Description: Role used by the Worker Agent when running in the Linux Fleet.
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Action:
@@ -377,7 +391,7 @@ Resources:
       Policies:
         - PolicyName: FleetWorkerLogs
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
@@ -385,7 +399,7 @@ Resources:
                   - logs:CreateLogStream
                 Resource:
                   - !Join
-                    - ''
+                    - ""
                     - - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*:/aws/deadline/
                       - !GetAtt DeadlineFarm.FarmId
                       - /*
@@ -401,7 +415,7 @@ Resources:
                   - logs:GetLogEvents
                 Resource:
                   - !Join
-                    - ''
+                    - ""
                     - - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*:/aws/deadline/
                       - !GetAtt DeadlineFarm.FarmId
                       - /*
@@ -417,7 +431,7 @@ Resources:
       RoleName: !Sub DeadlineCloudAgent-E2E-WindowsHostRole-${AWS::Region}
       Description: Instance role for worker hosts running Windows
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
@@ -428,7 +442,7 @@ Resources:
       Policies:
         - PolicyName: TestFixturesBootstrapping
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
@@ -436,7 +450,7 @@ Resources:
                   - s3:GetObject
                 Resource:
                   - !Join
-                    - ''
+                    - ""
                     - - !GetAtt FixturesBootstrapBucket.Arn
                       - /*
               - Effect: Allow
@@ -448,7 +462,7 @@ Resources:
                 Action:
                   - sts:GetServiceBearerToken
                 Resource:
-                  - '*'
+                  - "*"
               - Effect: Allow
                 Action:
                   - codeartifact:ReadFromRepository
@@ -481,7 +495,7 @@ Resources:
       RoleName: !Sub DeadlineCloudAgent-E2E-WindowsFleetRole-${AWS::Region}
       Description: Role used by the Worker Agent when running in the Windows Fleet.
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Action:
@@ -492,7 +506,7 @@ Resources:
       Policies:
         - PolicyName: FleetWorkerLogs
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
@@ -500,7 +514,7 @@ Resources:
                   - logs:CreateLogStream
                 Resource:
                   - !Join
-                    - ''
+                    - ""
                     - - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*:/aws/deadline/
                       - !GetAtt DeadlineFarm.FarmId
                       - /*
@@ -516,7 +530,7 @@ Resources:
                   - logs:GetLogEvents
                 Resource:
                   - !Join
-                    - ''
+                    - ""
                     - - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*:/aws/deadline/
                       - !GetAtt DeadlineFarm.FarmId
                       - /*
@@ -535,7 +549,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Action:
@@ -544,9 +558,23 @@ Resources:
               Service:
                 - !Sub credentials.deadline.${AWS::URLSuffix}
       Policies:
+        - PolicyName: TaskLogPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  # Allow Deadline Cloud Monitor users to read Task logs
+                  - logs:GetLogEvents
+                Resource:
+                  - !Join
+                    - ""
+                    - - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*:/aws/deadline/
+                      - !GetAtt DeadlineFarm.FarmId
+                      - /*
         - PolicyName: JobAttachmentsPermissions
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
@@ -557,7 +585,7 @@ Resources:
                 Resource:
                   - !GetAtt JobAttachmentsBucket.Arn
                   - !Join
-                    - ''
+                    - ""
                     - - !GetAtt JobAttachmentsBucket.Arn
                       - /*
       Tags:
@@ -568,7 +596,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Action:
@@ -579,7 +607,7 @@ Resources:
       Policies:
         - PolicyName: NonValidJobAttachmentsPermissions
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
@@ -588,7 +616,7 @@ Resources:
                 Resource:
                   - !GetAtt JobAttachmentsBucket.Arn
                   - !Join
-                    - ''
+                    - ""
                     - - !GetAtt JobAttachmentsBucket.Arn
                       - /*
       Tags:
@@ -607,7 +635,7 @@ Resources:
         ExcludePunctuation: true
         GenerateStringKey: password
         PasswordLength: 30
-        SecretStringTemplate: '{}'
+        SecretStringTemplate: "{}"
       Tags:
         - Key: Origin
           Value: DeadlineCloudAgentE2ETest
@@ -623,12 +651,63 @@ Resources:
     Properties:
       DisplayName: DeadlineCloudAgent-E2ETesting
 
+  LinuxFleetStorageProfile:
+    Type: AWS::Deadline::StorageProfile
+    Properties:
+      DisplayName: "LinuxFleetStorageProfile"
+      FarmId: !GetAtt DeadlineFarm.FarmId # Reference to your Deadline Farm ID
+      OsFamily: "LINUX" # Valid values: LINUX, WINDOWS, or MACOS
+      FileSystemLocations:
+        - Name: "StorageProfileTest"
+          Path: "/tmp/storageprofiletest/dest"
+          Type: "LOCAL"
+
+  LinuxJobStorageProfile:
+    Type: AWS::Deadline::StorageProfile
+    Properties:
+      DisplayName: "LinuxJobStorageProfile"
+      FarmId: !GetAtt DeadlineFarm.FarmId # Reference to your Deadline Farm ID
+      OsFamily: "LINUX" # Valid values: LINUX, WINDOWS, or MACOS
+      FileSystemLocations:
+        - Name: "StorageProfileTest"
+          Path: "/tmp/storageprofiletest"
+          Type: "LOCAL"
+
+  WindowsJobStorageProfile:
+    Type: AWS::Deadline::StorageProfile
+    Properties:
+      DisplayName: "WindowsJobStorageProfile"
+      FarmId: !GetAtt DeadlineFarm.FarmId # Reference to your Deadline Farm ID
+      OsFamily: "WINDOWS" # Valid values: LINUX, WINDOWS, or MACOS
+      FileSystemLocations:
+        - Name: "StorageProfileTest"
+          Path: "C:\\Users\\Public\\submission"
+          Type: "LOCAL"
+
+  WindowsFleetStorageProfile:
+    Type: AWS::Deadline::StorageProfile
+    Properties:
+      DisplayName: "WindowsFleetStorageProfile"
+      FarmId: !GetAtt DeadlineFarm.FarmId # Reference to your Deadline Farm ID
+      OsFamily: "WINDOWS" # Valid values: LINUX, WINDOWS, or MACOS
+      FileSystemLocations:
+        - Name: "StorageProfileTest"
+          Path: "C:\\Users\\Public\\worker"
+          Type: "LOCAL"
+
   MainQueue:
     Type: AWS::Deadline::Queue
     Properties:
       DisplayName: MainQueue
       Description: The main queue that test jobs are submitted to
       FarmId: !GetAtt DeadlineFarm.FarmId
+      AllowedStorageProfileIds:
+        - !GetAtt WindowsFleetStorageProfile.StorageProfileId
+        - !GetAtt WindowsJobStorageProfile.StorageProfileId
+        - !GetAtt LinuxJobStorageProfile.StorageProfileId
+        - !GetAtt LinuxFleetStorageProfile.StorageProfileId
+      RequiredFileSystemLocationNames:
+        - "StorageProfileTest"
       JobAttachmentSettings:
         RootPrefix: Deadline
         S3BucketName: !Ref JobAttachmentsBucket
@@ -646,7 +725,8 @@ Resources:
     Type: AWS::Deadline::Queue
     Properties:
       DisplayName: SecondaryQueue
-      Description: Queue used when a test needs to excersize queue-switching behavior
+      Description:
+        Queue used when a test needs to exercise queue-switching behavior
         and cross-queue permissions.
       FarmId: !GetAtt DeadlineFarm.FarmId
       JobAttachmentSettings:
@@ -661,6 +741,29 @@ Resources:
           PasswordArn: !Ref WindowsJobUserPasswordSecret
         RunAs: QUEUE_CONFIGURED_USER
       RoleArn: !GetAtt QueueRole.Arn
+      AllowedStorageProfileIds:
+        - !GetAtt WindowsFleetStorageProfile.StorageProfileId
+        - !GetAtt WindowsJobStorageProfile.StorageProfileId
+        - !GetAtt LinuxJobStorageProfile.StorageProfileId
+        - !GetAtt LinuxFleetStorageProfile.StorageProfileId
+
+  JobsRunAsAgentUserQueue:
+    Type: AWS::Deadline::Queue
+    Properties:
+      DisplayName: JobsRunAsAgentUserQueue
+      Description: 
+        Queue configured to run jobs as the worker agent user
+        Used for testing test_override_job_user
+      FarmId: !GetAtt DeadlineFarm.FarmId
+      JobAttachmentSettings:
+        RootPrefix: Deadline
+        S3BucketName: !Ref JobAttachmentsBucket
+      JobRunAsUser:
+        RunAs: WORKER_AGENT_USER
+      RoleArn: !GetAtt QueueRole.Arn
+      AllowedStorageProfileIds:
+        - !GetAtt WindowsFleetStorageProfile.StorageProfileId
+        - !GetAtt LinuxFleetStorageProfile.StorageProfileId
 
   NonValidRoleQueue:
     Type: AWS::Deadline::Queue
@@ -680,13 +783,18 @@ Resources:
           PasswordArn: !Ref WindowsJobUserPasswordSecret
         RunAs: QUEUE_CONFIGURED_USER
       RoleArn: !GetAtt NonValidQueueRole.Arn
-
+      AllowedStorageProfileIds:
+        - !GetAtt WindowsFleetStorageProfile.StorageProfileId
+        - !GetAtt WindowsJobStorageProfile.StorageProfileId
+        - !GetAtt LinuxJobStorageProfile.StorageProfileId
+        - !GetAtt LinuxFleetStorageProfile.StorageProfileId
 
   AutoscalingQueue:
     Type: AWS::Deadline::Queue
     Properties:
       DisplayName: AutoscalingQueue
-      Description: Queue used when a test needs to exercise fleet autoscaling-related
+      Description:
+        Queue used when a test needs to exercise fleet autoscaling-related
         behavior
       FarmId: !GetAtt DeadlineFarm.FarmId
       JobAttachmentSettings:
@@ -712,6 +820,7 @@ Resources:
       RoleArn: !GetAtt LinuxFleetRole.Arn
       Configuration:
         CustomerManaged:
+          StorageProfileId: !GetAtt LinuxFleetStorageProfile.StorageProfileId
           Mode: NO_SCALING
           WorkerCapabilities:
             CpuArchitectureType: x86_64
@@ -722,6 +831,14 @@ Resources:
             VCpuCount:
               Min: 2
               Max: 4
+    DependsOn:
+      # When adding storage profile to a fleet,
+      # all queues associated with the fleet need to be updated to allow it first.
+      # The order has to be reversed when removing the storage profile from fleet.
+      - MainQueue
+      - SecondaryQueue
+      - JobsRunAsAgentUserQueue
+      - NonValidRoleQueue
 
   LinuxAutoScalingFleetx86:
     Type: AWS::Deadline::Fleet
@@ -754,6 +871,7 @@ Resources:
       RoleArn: !GetAtt WindowsFleetRole.Arn
       Configuration:
         CustomerManaged:
+          StorageProfileId: !GetAtt WindowsFleetStorageProfile.StorageProfileId
           Mode: NO_SCALING
           WorkerCapabilities:
             CpuArchitectureType: x86_64
@@ -764,6 +882,14 @@ Resources:
             VCpuCount:
               Min: 2
               Max: 4
+    DependsOn:
+      # When adding storage profile to a fleet,
+      # all queues associated with the fleet need to be updated to allow it first.
+      # The order has to be reversed when removing the storage profile from fleet.
+      - MainQueue
+      - SecondaryQueue
+      - JobsRunAsAgentUserQueue
+      - NonValidRoleQueue
 
   WindowsAutoScalingFleetx86:
     Type: AWS::Deadline::Fleet
@@ -800,6 +926,13 @@ Resources:
       FleetId: !GetAtt LinuxManualScalingFleetx86.FleetId
       QueueId: !GetAtt SecondaryQueue.QueueId
 
+  LinuxManualFleetJobsRunAsAgentUserQueueQFA:
+    Type: AWS::Deadline::QueueFleetAssociation
+    Properties:
+      FarmId: !GetAtt DeadlineFarm.FarmId
+      FleetId: !GetAtt LinuxManualScalingFleetx86.FleetId
+      QueueId: !GetAtt JobsRunAsAgentUserQueue.QueueId
+
   LinuxManualFleetNonValidRoleQueueQFA:
     Type: AWS::Deadline::QueueFleetAssociation
     Properties:
@@ -827,7 +960,14 @@ Resources:
       FarmId: !GetAtt DeadlineFarm.FarmId
       FleetId: !GetAtt WindowsManualScalingFleetx86.FleetId
       QueueId: !GetAtt SecondaryQueue.QueueId
-  
+
+  WindowsManualFleetJobsRunAsAgentUserQueueQFA:
+    Type: AWS::Deadline::QueueFleetAssociation
+    Properties:
+      FarmId: !GetAtt DeadlineFarm.FarmId
+      FleetId: !GetAtt WindowsManualScalingFleetx86.FleetId
+      QueueId: !GetAtt JobsRunAsAgentUserQueue.QueueId
+
   WindowsManualFleetNonValidRoleQueueQFA:
     Type: AWS::Deadline::QueueFleetAssociation
     Properties:

@@ -1,17 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 from __future__ import annotations
-from datetime import datetime, timedelta
-from pathlib import PurePosixPath, PureWindowsPath
-from threading import Event, RLock
+
+import os
+from collections.abc import Generator, Iterable
+from concurrent.futures import wait
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from threading import RLock
 from types import TracebackType
-from typing import Generator, Iterable, Literal, Optional
-from unittest.mock import patch, MagicMock, ANY
+from typing import Literal, Optional
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
-from openjd.model import ParameterValue
-import os
 
+from openjd.model import ParameterValue
 from openjd.model.v2023_09 import (
     Action,
     Environment,
@@ -20,23 +23,32 @@ from openjd.model.v2023_09 import (
     StepActions,
     StepScript,
     StepTemplate,
+    CommandString,
+    ArgListType,
+    ArgString,
+    ExtensionName,
 )
 from openjd.sessions import (
     ActionState,
     ActionStatus,
     PathFormat,
     PathMappingRule,
-    SessionUser,
     PosixSessionUser,
+    SessionUser,
     WindowsSessionUser,
 )
 
-from deadline_worker_agent.api_models import EnvironmentAction, TaskRunAction
+from deadline_worker_agent.api_models import (
+    EnvironmentAction,
+    TaskRunAction,
+    AttachmentUploadAction,
+    ManifestInfo,
+)
 from deadline_worker_agent.sessions import Session
+from deadline_worker_agent.sessions.runtime import SessionRuntime
+from deadline_worker_agent._session_runtime_kind import SessionRuntimeKind
 import deadline_worker_agent.sessions.session as session_mod
 from deadline_worker_agent.sessions.session import (
-    LOW_TRANSFER_RATE_THRESHOLD,
-    LOW_TRANSFER_COUNT_THRESHOLD,
     CurrentAction,
     SessionActionStatus,
 )
@@ -45,6 +57,7 @@ from deadline_worker_agent.sessions.actions import (
     ExitEnvironmentAction,
     RunStepTaskAction,
 )
+
 from deadline_worker_agent.sessions.job_entities import (
     EnvironmentDetails,
     JobAttachmentDetails,
@@ -56,21 +69,14 @@ from deadline_worker_agent.log_messages import (
     SessionActionLogEventSubtype,
 )
 from deadline.job_attachments.models import (
-    Attachments,
-    JobAttachmentsFileSystem,
-    JobAttachmentS3Settings,
+    UploadManifestInfo,
 )
-from deadline.job_attachments.os_file_permission import (
-    FileSystemPermissionSettings,
-    PosixFileSystemPermissionSettings,
-    WindowsFileSystemPermissionSettings,
-    WindowsPermissionEnum,
+import deadline_worker_agent.sessions.log_config as log_config_mod
+from deadline_worker_agent.sessions.job_entities.job_attachment_details import (
+    JobAttachmentManifestProperties,
 )
-
-from deadline.job_attachments.progress_tracker import (
-    ProgressReportMetadata,
-    ProgressStatus,
-    SummaryStatistics,
+from deadline_worker_agent.sessions.attachment_models import (
+    WorkerManifestProperties,
 )
 
 
@@ -118,16 +124,18 @@ def action_complete_time() -> datetime:
 
 
 @pytest.fixture
-def mock_openjd_session_cls() -> Generator[MagicMock, None, None]:
-    """Mocks the Worker Agent Session module's import of the Open Job Description Session class"""
-    with patch.object(session_mod, "OPENJDSession") as mock_openjd_session:
-        yield mock_openjd_session
+def mock_create_runtime() -> Generator[MagicMock, None, None]:
+    """Patches create_session_runtime in the session module and yields the mock factory."""
+    with patch.object(session_mod, "create_session_runtime") as mock_create:
+        yield mock_create
 
 
 @pytest.fixture
-def mock_openjd_session(mock_openjd_session_cls: MagicMock) -> MagicMock:
-    """The mocked Open Job Description Session class instance"""
-    return mock_openjd_session_cls.return_value
+def mock_runtime(mock_create_runtime: MagicMock) -> MagicMock:
+    """A MagicMock standing in for the SessionRuntime created by Session.__init__."""
+    runtime = MagicMock(spec=SessionRuntime)
+    mock_create_runtime.return_value = runtime
+    return runtime
 
 
 @pytest.fixture
@@ -142,30 +150,19 @@ def action_update_lock() -> MagicMock:
     return MagicMock()
 
 
-@pytest.fixture(autouse=True)
-def mock_telemetry_event_for_sync_inputs() -> Generator[MagicMock, None, None]:
-    with patch.object(session_mod, "record_sync_inputs_telemetry_event") as mock_telemetry_event:
-        yield mock_telemetry_event
-
-
-@pytest.fixture(autouse=True)
-def mock_telemetry_event_for_sync_outputs() -> Generator[MagicMock, None, None]:
-    with patch.object(session_mod, "record_sync_outputs_telemetry_event") as mock_telemetry_event:
-        yield mock_telemetry_event
-
-
 @pytest.fixture
 def session(
     asset_sync: MagicMock,
     env: dict[str, str] | None,
     job_details: JobDetails,
     os_user: SessionUser | None,
-    mock_openjd_session_cls: MagicMock,
+    mock_runtime: MagicMock,
     queue_id: str,
     session_action_queue: MagicMock,
     session_id: str,
     action_update_callback: MagicMock,
     action_update_lock: MagicMock,
+    session_root_dir: Path,
 ) -> Session:
     """A fixture that creates and returns the Worker Session"""
     return Session(
@@ -179,6 +176,7 @@ def session(
         job_id="job-1234",
         action_update_callback=action_update_callback,
         action_update_lock=action_update_lock,
+        session_root_dir=session_root_dir,
     )
 
 
@@ -187,8 +185,8 @@ def run_step_task_action(
     action_id: str,
     step_id: str,
     task_id: str,
-    command: str,
-    on_run_args: list[str],
+    command: CommandString,
+    on_run_args: ArgListType,
 ) -> RunStepTaskAction:
     """A fixture that provides a RunStepTaskAction"""
     return RunStepTaskAction(
@@ -226,7 +224,7 @@ def enter_env_action(
                 script=EnvironmentScript(
                     actions=EnvironmentActions(
                         onEnter=Action(
-                            command="test",
+                            command=CommandString("test"),
                         ),
                     ),
                 ),
@@ -361,19 +359,19 @@ class TestSessionInit:
     def test_uses_action_updated_callback(
         self,
         session: Session,
-        mock_openjd_session_cls: MagicMock,
+        mock_create_runtime: MagicMock,
     ) -> None:
         """Asserts that the Session.update_action method is called by the callback supplied to the
         Open Job Description session initializer."""
         # GIVEN
-        mock_openjd_session_cls.assert_called_once()
-        call = mock_openjd_session_cls.call_args_list[0]
+        mock_create_runtime.assert_called_once()
+        config = mock_create_runtime.call_args[0][1]
         action_status = ActionStatus(state=ActionState.SUCCESS)
 
         # THEN
         with patch.object(session, "update_action") as mock_update_action:
             # WHEN
-            call.kwargs["callback"](session.id, action_status)
+            config.action_callback(session.id, action_status)
             mock_update_action.assert_called_once_with(action_status)
 
     def test_creates_current_action_lock(
@@ -425,19 +423,18 @@ class TestSessionInit:
     def test_has_path_mapping_rules(
         self,
         session: Session,
-        mock_openjd_session_cls: MagicMock,
+        mock_create_runtime: MagicMock,
         path_mapping_rules: list[PathMappingRule],
     ):
         """Ensure that when we have path mapping rules that we're passing them to the Open Job Description session"""
         # GIVEN / WHEN / THEN
         assert session is not None
-        mock_openjd_session_cls.assert_called_once()
+        mock_create_runtime.assert_called_once()
+        config = mock_create_runtime.call_args[0][1]
         if path_mapping_rules:
-            assert (
-                path_mapping_rules == mock_openjd_session_cls.call_args.kwargs["path_mapping_rules"]
-            )
+            assert path_mapping_rules == config.path_mapping_rules
         else:
-            assert not mock_openjd_session_cls.call_args.kwargs.get("path_mapping_rules", False)
+            assert not config.path_mapping_rules
 
     @pytest.mark.parametrize(
         "env",
@@ -465,17 +462,102 @@ class TestSessionInit:
     def test_has_env_variables(
         self,
         session: Session,
-        mock_openjd_session_cls: MagicMock,
+        mock_create_runtime: MagicMock,
         env: dict[str, str],
     ):
         """Ensure that when we have env variables that we're passing them to the Open Job Description session"""
         # GIVEN / WHEN / THEN
         assert session is not None
-        mock_openjd_session_cls.assert_called_once()
+        mock_create_runtime.assert_called_once()
+        config = mock_create_runtime.call_args[0][1]
         if env:
-            assert env == mock_openjd_session_cls.call_args.kwargs["os_env_vars"]
+            assert env == config.os_env_vars
         else:
-            assert not mock_openjd_session_cls.call_args.kwargs.get("os_env_vars", False)
+            assert not config.os_env_vars
+
+    @pytest.mark.parametrize(
+        argnames="session_root_dir",
+        argvalues=(
+            pytest.param(Path("/foo"), id="1"),
+            pytest.param(Path("/bar"), id="1"),
+        ),
+    )
+    def test_has_session_root_dir(
+        self,
+        session: Session,
+        mock_create_runtime: MagicMock,
+        session_root_dir: Path,
+    ) -> None:
+        """Ensure that Session passes session_root_dir when creating the Open Job Description session"""
+        # THEN
+        mock_create_runtime.assert_called_once()
+        config = mock_create_runtime.call_args[0][1]
+        assert config.session_root_directory == session_root_dir
+
+
+class TestSessionRuntimeKind:
+    """Tests that Session passes the correct session_runtime_kind to create_session_runtime."""
+
+    def test_explicit_runtime_kind_passed(
+        self,
+        asset_sync: MagicMock,
+        job_details: "JobDetails",
+        os_user: "SessionUser | None",
+        mock_create_runtime: MagicMock,
+        queue_id: str,
+        session_action_queue: MagicMock,
+        action_update_callback: MagicMock,
+        action_update_lock: MagicMock,
+        session_root_dir: Path,
+    ) -> None:
+        """When session_runtime_kind=RUST is passed, RUST is forwarded to create_session_runtime."""
+        Session(
+            id="session-test-rust",
+            asset_sync=asset_sync,
+            env=None,
+            job_details=job_details,
+            os_user=os_user,
+            queue=session_action_queue,
+            queue_id=queue_id,
+            job_id="job-1234",
+            action_update_callback=action_update_callback,
+            action_update_lock=action_update_lock,
+            session_root_dir=session_root_dir,
+            session_runtime_kind=SessionRuntimeKind.RUST,
+        )
+
+        mock_create_runtime.assert_called_once()
+        assert mock_create_runtime.call_args[0][0] == SessionRuntimeKind.RUST
+
+    def test_default_runtime_kind_is_python(
+        self,
+        asset_sync: MagicMock,
+        job_details: "JobDetails",
+        os_user: "SessionUser | None",
+        mock_create_runtime: MagicMock,
+        queue_id: str,
+        session_action_queue: MagicMock,
+        action_update_callback: MagicMock,
+        action_update_lock: MagicMock,
+        session_root_dir: Path,
+    ) -> None:
+        """When session_runtime_kind is omitted, PYTHON is forwarded to create_session_runtime."""
+        Session(
+            id="session-test-default",
+            asset_sync=asset_sync,
+            env=None,
+            job_details=job_details,
+            os_user=os_user,
+            queue=session_action_queue,
+            queue_id=queue_id,
+            job_id="job-1234",
+            action_update_callback=action_update_callback,
+            action_update_lock=action_update_lock,
+            session_root_dir=session_root_dir,
+        )
+
+        mock_create_runtime.assert_called_once()
+        assert mock_create_runtime.call_args[0][0] == SessionRuntimeKind.PYTHON
 
 
 class TestSessionOuterRun:
@@ -489,15 +571,6 @@ class TestSessionOuterRun:
         """Fixture to patch Session._run() with a MagicMock and return it"""
         with patch.object(session, "_run") as mock_inner_run:
             yield mock_inner_run
-
-    @pytest.fixture(autouse=True)
-    def mock_sync_asset_inputs(
-        self,
-        session: Session,
-    ) -> Generator[MagicMock, None, None]:
-        """Fixture to patch Session.sync_asset_inputs with a MagicMock and return it"""
-        with patch.object(session, "sync_asset_inputs") as mock_sync_asset_inputs:
-            yield mock_sync_asset_inputs
 
     @pytest.fixture(autouse=True)
     def mock_cleanup(
@@ -620,349 +693,6 @@ class TestSessionOuterRun:
         # THEN
         # it did not error
         session_action_queue._job_entities.cache_entities.assert_called_once()
-
-
-class TestSessionSyncAssetInputs:
-    @pytest.fixture(autouse=True)
-    def mock_asset_sync(self, session: Session) -> Generator[MagicMock, None, None]:
-        with patch.object(session, "_asset_sync") as mock_asset_sync:
-            yield mock_asset_sync
-
-    # This overrides the job_attachments_file_system fixture in tests/unit/conftest.py which feeds into
-    # the job_attachment_details fixture
-    @pytest.mark.parametrize(
-        "job_attachments_file_system", [e.value for e in JobAttachmentsFileSystem]
-    )
-    @pytest.mark.skipif(os.name != "posix", reason="Posix-only test.")
-    def test_asset_loading_method(
-        self,
-        session: Session,
-        job_attachments_file_system: JobAttachmentsFileSystem,
-        mock_asset_sync: MagicMock,
-        mock_telemetry_event_for_sync_inputs: MagicMock,
-        job_attachment_details: JobAttachmentDetails,
-    ) -> None:
-        """Tests that the job_attachments_file_system specified in session._job_details is properly passed to the sync_inputs function"""
-        # GIVEN
-        mock_ja_sync_inputs: MagicMock = mock_asset_sync.sync_inputs
-        mock_ja_sync_inputs.return_value = (SummaryStatistics(), {})
-        cancel = Event()
-
-        # WHEN
-        session.sync_asset_inputs(  # type: ignore
-            cancel=cancel,
-            job_attachment_details=job_attachment_details,
-        )
-
-        # THEN
-        mock_ja_sync_inputs.assert_called_with(
-            s3_settings=ANY,
-            queue_id=ANY,
-            job_id=ANY,
-            session_dir=ANY,
-            attachments=Attachments(
-                manifests=ANY,
-                fileSystem=job_attachments_file_system,
-            ),
-            fs_permission_settings=PosixFileSystemPermissionSettings(
-                os_user="some-user",
-                os_group="some-group",
-                dir_mode=0o20,
-                file_mode=0o20,
-            ),
-            storage_profiles_path_mapping_rules={},
-            step_dependencies=None,
-            on_downloading_files=ANY,
-            os_env_vars=None,
-        )
-
-        mock_telemetry_event_for_sync_inputs.assert_called_once_with(
-            "queue-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            SummaryStatistics(),
-        )
-
-    def test_sync_asset_inputs_with_fs_permission_settings(
-        self,
-        session: Session,
-        mock_asset_sync: MagicMock,
-        job_attachment_details: JobAttachmentDetails,
-    ):
-        """
-        Tests that sync_inputs function is called with the correct fs_permission_settings
-        argument based on the current OS.
-        """
-        # GIVEN
-        mock_sync_inputs: MagicMock = mock_asset_sync.sync_inputs
-        mock_sync_inputs.return_value = ({}, {})
-        cancel = Event()
-
-        expected_fs_permission_settings: Optional[FileSystemPermissionSettings] = None
-        if os.name == "posix":
-            expected_fs_permission_settings = PosixFileSystemPermissionSettings(
-                os_user="some-user",
-                os_group="some-group",
-                dir_mode=0o20,
-                file_mode=0o20,
-            )
-        elif os.name == "nt":
-            expected_fs_permission_settings = WindowsFileSystemPermissionSettings(
-                os_user="SomeUser",
-                dir_mode=WindowsPermissionEnum.WRITE,
-                file_mode=WindowsPermissionEnum.WRITE,
-            )
-
-        # WHEN
-        session.sync_asset_inputs(  # type: ignore
-            cancel=cancel,
-            job_attachment_details=job_attachment_details,
-        )
-
-        # THEN
-        mock_sync_inputs.assert_called_with(
-            s3_settings=ANY,
-            queue_id=ANY,
-            job_id=ANY,
-            session_dir=ANY,
-            attachments=Attachments(
-                manifests=ANY,
-                fileSystem=ANY,
-            ),
-            fs_permission_settings=expected_fs_permission_settings,
-            storage_profiles_path_mapping_rules={},
-            step_dependencies=None,
-            on_downloading_files=ANY,
-            os_env_vars=None,
-        )
-
-    @pytest.mark.parametrize(
-        "sync_asset_inputs_args_sequence, expected_error",
-        [
-            (
-                [
-                    {
-                        "job_attachment_details": JobAttachmentDetails(
-                            manifests=[],
-                            job_attachments_file_system="COPIED",
-                        )
-                    }
-                ],
-                False,
-            ),
-            (
-                [
-                    {
-                        "job_attachment_details": JobAttachmentDetails(
-                            manifests=[],
-                            job_attachments_file_system="COPIED",
-                        )
-                    },
-                    {"step_dependencies": ["step-1"]},
-                ],
-                False,
-            ),
-            (
-                [{"step_dependencies": ["step-1"]}],
-                True,
-            ),
-            ([{"job_attachment_details": None}], True),
-            ([{"step_dependencies": None}], True),
-            ([{"job_attachment_details": None}, {"step_dependencies": None}], True),
-        ],
-    )
-    def test_sync_asset_inputs(
-        self,
-        session: Session,
-        mock_asset_sync: MagicMock,
-        mock_telemetry_event_for_sync_inputs: MagicMock,
-        sync_asset_inputs_args_sequence: list[dict[str, JobAttachmentDetails | list[str]]],
-        expected_error: bool,
-    ):
-        """
-        Tests 'sync_asset_inputs' with a sequence of arguments and checks if it raises an error as expected.
-        For each test case, 'sync_asset_inputs' is called with each argument in the 'sync_asset_inputs_args_sequence'.
-        It then checks whether the function raises an error or not, which should match the 'expected_error'.
-        Also, asserts that 'record_sync_inputs_telemetry_event' is called with the correct arguments.
-        """
-        # GIVEN
-        mock_ja_sync_inputs: MagicMock = mock_asset_sync.sync_inputs
-        mock_ja_sync_inputs.return_value = (SummaryStatistics(), {})
-        cancel = Event()
-
-        if expected_error:
-            # WHEN
-            with pytest.raises(RuntimeError) as raise_ctx:
-                for args in sync_asset_inputs_args_sequence:
-                    session.sync_asset_inputs(cancel=cancel, **args)  # type: ignore
-            # THEN
-            assert (
-                raise_ctx.value.args[0]
-                == "Job attachments must be synchronized before downloading Step dependencies."
-            )
-        else:
-            # WHEN
-            for args in sync_asset_inputs_args_sequence:
-                session.sync_asset_inputs(cancel=cancel, **args)  # type: ignore
-            # THEN
-            for call in mock_telemetry_event_for_sync_inputs.call_args_list:
-                assert call[0] == (
-                    "queue-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    SummaryStatistics(),
-                )
-            assert mock_telemetry_event_for_sync_inputs.call_count == len(
-                sync_asset_inputs_args_sequence
-            )
-
-    def test_sync_asset_inputs_cancellation_by_low_transfer_rate(
-        self,
-        session: Session,
-        mock_asset_sync: MagicMock,
-    ):
-        """
-        Tests that the session is canceled if it observes a series of alarmingly low transfer rates.
-        """
-
-        # Mock out the Job Attachment's sync_inputs function to report multiple consecutive low transfer rates
-        # (lower than the threshold) via callback function.
-        def mock_sync_inputs(on_downloading_files, *args, **kwargs):
-            low_transfer_rate_report = ProgressReportMetadata(
-                status=ProgressStatus.DOWNLOAD_IN_PROGRESS,
-                progress=0.0,
-                transferRate=LOW_TRANSFER_RATE_THRESHOLD / 2,
-                progressMessage="",
-            )
-            for _ in range(LOW_TRANSFER_COUNT_THRESHOLD):
-                on_downloading_files(low_transfer_rate_report)
-            return ({}, {})
-
-        mock_asset_sync.sync_inputs = mock_sync_inputs
-        mock_cancel = MagicMock(spec=Event)
-
-        with (
-            patch.object(session, "update_action") as mock_update_action,
-            patch.object(
-                session_mod, "record_sync_inputs_fail_telemetry_event"
-            ) as mock_record_sync_inputs_fail_telemetry_event,
-        ):
-            session.sync_asset_inputs(  # type: ignore
-                cancel=mock_cancel,
-                job_attachment_details=JobAttachmentDetails(
-                    manifests=[],
-                    job_attachments_file_system=JobAttachmentsFileSystem.COPIED,
-                ),
-            )
-        mock_cancel.set.assert_called_once()
-        mock_update_action.assert_called_with(
-            ActionStatus(
-                state=ActionState.FAILED,
-                fail_message=(
-                    f"Input syncing failed due to successive low transfer rates (< {LOW_TRANSFER_RATE_THRESHOLD / 1000} KB/s). "
-                    f"The transfer rate was below the threshold for the last {session._seconds_to_minutes_str(LOW_TRANSFER_COUNT_THRESHOLD)}."
-                ),
-            ),
-        )
-        mock_record_sync_inputs_fail_telemetry_event.assert_called_once_with(
-            queue_id="queue-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            failure_reason=(
-                "Insufficient download speed: "
-                f"Input syncing failed due to successive low transfer rates (< {LOW_TRANSFER_RATE_THRESHOLD / 1000} KB/s). "
-                f"The transfer rate was below the threshold for the last {session._seconds_to_minutes_str(LOW_TRANSFER_COUNT_THRESHOLD)}."
-            ),
-        )
-
-    @pytest.mark.parametrize(
-        "seconds, expected_str",
-        [
-            (0, "0 seconds"),
-            (1, "1 second"),
-            (30, "30 seconds"),
-            (60, "1 minute"),
-            (61, "1 minute 1 second"),
-            (90, "1 minute 30 seconds"),
-            (120, "2 minutes"),
-            (121, "2 minutes 1 second"),
-            (150, "2 minutes 30 seconds"),
-        ],
-    )
-    def test_seconds_to_minutes_str(self, session: Session, seconds: int, expected_str: str):
-        assert session._seconds_to_minutes_str(seconds) == expected_str
-
-
-class TestSessionSyncAssetOutputs:
-    @pytest.fixture(autouse=True)
-    def mock_asset_sync(self, session: Session) -> Generator[MagicMock, None, None]:
-        with patch.object(session, "_asset_sync") as mock_asset_sync:
-            yield mock_asset_sync
-
-    def test_sync_asset_outputs(
-        self,
-        action_id: str,
-        queue_id: str,
-        step_id: str,
-        task_id: str,
-        action_start_time: datetime,
-        session: Session,
-        job_attachment_details: JobAttachmentDetails,
-        mock_asset_sync: MagicMock,
-        mock_telemetry_event_for_sync_outputs: MagicMock,
-    ):
-        """
-        Tests that session's '_sync_asset_outputs' calls Job Attachment's method 'sync_outputs' correctly.
-        Also, asserts that 'record_sync_outputs_telemetry_event' is called once with the correct arguments.
-        """
-        # GIVEN
-        mock_ja_sync_outputs: MagicMock = mock_asset_sync.sync_outputs
-        mock_ja_sync_outputs.return_value = SummaryStatistics()
-        current_action = CurrentAction(
-            definition=RunStepTaskAction(
-                details=StepDetails(
-                    step_template=StepTemplate(
-                        name="Test",
-                        script=StepScript(
-                            actions=StepActions(
-                                onRun=Action(
-                                    command="echo",
-                                    args=["hello"],
-                                ),
-                            ),
-                        ),
-                    ),
-                    step_id=step_id,
-                ),
-                id=action_id,
-                task_id=task_id,
-                task_parameter_values=dict[str, ParameterValue](),
-            ),
-            start_time=action_start_time,
-        )
-        session._job_attachment_details = job_attachment_details
-
-        # WHEN
-        session._sync_asset_outputs(current_action=current_action)  # type: ignore
-
-        # THEN
-        mock_ja_sync_outputs.assert_called_once_with(
-            s3_settings=JobAttachmentS3Settings(
-                rootPrefix="job_attachments",
-                s3BucketName="job_attachments_bucket",
-            ),
-            attachments=Attachments(
-                manifests=ANY,
-                fileSystem=JobAttachmentsFileSystem.COPIED,
-            ),
-            queue_id=queue_id,
-            job_id=ANY,
-            step_id=step_id,
-            task_id=task_id,
-            session_action_id=action_id,
-            start_time=ANY,
-            session_dir=ANY,
-            storage_profiles_path_mapping_rules={},
-            on_uploading_files=ANY,
-        )
-        mock_telemetry_event_for_sync_outputs.assert_called_once_with(
-            "queue-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            SummaryStatistics(),
-        )
 
 
 class TestSessionInnerRun:
@@ -1149,13 +879,13 @@ class TestSessionCancelActionsImpl:
     def test_cancels_current_action(
         self,
         session: Session,
-        mock_openjd_session: MagicMock,
+        mock_runtime: MagicMock,
         current_action: CurrentAction,
     ) -> None:
         """Asserts that the current action is canceled if cancel_actions() is called with the
         corresponding action ID in the action_ids argument."""
         # GIVEN
-        openjd_cancel_action: MagicMock = mock_openjd_session.cancel_action
+        openjd_cancel_action: MagicMock = mock_runtime.cancel_action
 
         # WHEN
         session._cancel_actions_impl(action_ids=[current_action.definition.id])
@@ -1294,6 +1024,20 @@ class TestSessionActionUpdatedImpl:
         with patch.object(session, "_report_action_update") as mock_report_action_update:
             yield mock_report_action_update
 
+    @pytest.fixture
+    def mock_action_output_log_filter(self) -> Generator[MagicMock, None, None]:
+        """Returns a patched mock for ActionOutputCaptureFilter"""
+        with patch(
+            "deadline_worker_agent.sessions.session.ActionOutputCaptureFilter"
+        ) as mock_filter:
+            yield mock_filter
+
+    @pytest.fixture
+    def mock_openjd_log(self) -> Generator[MagicMock, None, None]:
+        """Returns a patched mock for OPENJD_LOG"""
+        with patch("deadline_worker_agent.sessions.session.OPENJD_LOG") as mock_log:
+            yield mock_log
+
     def test_failed_enter_env(
         self,
         action_id: str,
@@ -1317,7 +1061,7 @@ class TestSessionActionUpdatedImpl:
                         script=EnvironmentScript(
                             actions=EnvironmentActions(
                                 onEnter=Action(
-                                    command="test",
+                                    command=CommandString("test"),
                                 ),
                             ),
                         ),
@@ -1339,14 +1083,16 @@ class TestSessionActionUpdatedImpl:
             start_time=action_start_time,
             completed_status="FAILED",
             end_time=action_complete_time,
+            manifests=None,
         )
 
-        with patch.object(session, "_sync_asset_outputs") as mock_sync_asset_outputs:
-            # WHEN
-            session._action_updated_impl(
-                action_status=failed_action_status,
-                now=action_complete_time,
-            )
+        # WHEN
+        future = session._action_updated_impl(
+            action_status=failed_action_status,
+            now=action_complete_time,
+        )
+        if future:
+            wait([future])
 
         # THEN
         mock_report_action_update.assert_called_once_with(expected_action_update)
@@ -1354,7 +1100,6 @@ class TestSessionActionUpdatedImpl:
             message=expected_next_action_message,
             ignore_env_exits=True,
         )
-        mock_sync_asset_outputs.assert_not_called()
         assert session._current_action is None, "Current session action emptied"
 
     def test_failed_task_run(
@@ -1381,8 +1126,8 @@ class TestSessionActionUpdatedImpl:
                         script=StepScript(
                             actions=StepActions(
                                 onRun=Action(
-                                    command="echo",
-                                    args=["hello"],
+                                    command=CommandString("echo"),
+                                    args=[ArgString("hello")],
                                 ),
                             ),
                         ),
@@ -1406,14 +1151,16 @@ class TestSessionActionUpdatedImpl:
             start_time=action_start_time,
             completed_status="FAILED",
             end_time=action_complete_time,
+            manifests=None,
         )
 
-        with patch.object(session, "_sync_asset_outputs") as mock_sync_asset_outputs:
-            # WHEN
-            session._action_updated_impl(
-                action_status=failed_action_status,
-                now=action_complete_time,
-            )
+        # WHEN
+        future = session._action_updated_impl(
+            action_status=failed_action_status,
+            now=action_complete_time,
+        )
+        if future:
+            wait([future])
 
         # THEN
         mock_report_action_update.assert_called_once_with(expected_action_update)
@@ -1422,9 +1169,8 @@ class TestSessionActionUpdatedImpl:
             ignore_env_exits=True,
         )
         assert session._current_action is None, "Current session action emptied"
-        mock_sync_asset_outputs.assert_not_called()
 
-    def test_success_task_run(
+    def test_success_task_run_attachment_upload(
         self,
         action_id: str,
         session_action_queue: MagicMock,
@@ -1439,6 +1185,8 @@ class TestSessionActionUpdatedImpl:
         """Tests that if a task run succeeds (the Open Job Description action), that job attachment output
         sync is performed, and AFTER that, the action success is returned."""
         # GIVEN
+        session._job_attachment_details = MagicMock()
+
         current_action = CurrentAction(
             definition=RunStepTaskAction(
                 details=StepDetails(
@@ -1447,8 +1195,8 @@ class TestSessionActionUpdatedImpl:
                         script=StepScript(
                             actions=StepActions(
                                 onRun=Action(
-                                    command="echo",
-                                    args=["hello"],
+                                    command=CommandString("echo"),
+                                    args=[ArgString("hello")],
                                 ),
                             ),
                         ),
@@ -1463,121 +1211,166 @@ class TestSessionActionUpdatedImpl:
         )
         session._current_action = current_action
         queue_cancel_all: MagicMock = session_action_queue.cancel_all
-        expected_action_update = SessionActionStatus(
-            id=action_id,
-            status=success_action_status,
-            start_time=action_start_time,
-            completed_status="SUCCEEDED",
-            end_time=action_complete_time,
-        )
 
         def mock_now(*arg, **kwarg) -> datetime:
             return action_complete_time
 
         with (
             patch.object(session_mod, "datetime") as mock_datetime,
-            patch.object(session, "_sync_asset_outputs") as mock_sync_asset_outputs,
         ):
             mock_datetime.now.side_effect = mock_now
 
-            # Assert that reporting the action update happens AFTER syncing the output job
-            # attachments.
-            def sync_asset_outputs_side_effect(*, current_action: CurrentAction) -> None:
-                mock_report_action_update.assert_not_called()
-
-            mock_sync_asset_outputs.side_effect = sync_asset_outputs_side_effect
-
             # WHEN
-            session._action_updated_impl(
+            future = session._action_updated_impl(
                 action_status=success_action_status,
                 now=action_complete_time,
             )
+            if future:
+                wait([future])
 
         # THEN
-        mock_report_action_update.assert_called_once_with(expected_action_update)
+        mock_report_action_update.assert_not_called()
         queue_cancel_all.assert_not_called()
+        assert session._output_sync_target_action == current_action
         assert session._current_action is None, "Current session action emptied"
-        mock_sync_asset_outputs.assert_called_once_with(current_action=current_action)
+        session_action_queue.insert_front.assert_called_once_with(
+            action=AttachmentUploadAction(
+                sessionActionId=action_id,
+                actionType="SYNC_OUTPUT_JOB_ATTACHMENTS",
+                stepId=step_id,
+                taskId=task_id,
+                startTime=action_start_time.timestamp(),
+            )
+        )
 
-    def test_success_task_run_fail_output_sync(
+    def test_success_task_run_attachment_upload_with_no_output_manifest(
         self,
-        action_id: str,
-        session_action_queue: MagicMock,
         session: Session,
-        action_start_time: datetime,
-        action_complete_time: datetime,
-        step_id: str,
-        success_action_status: ActionStatus,
-        task_id: str,
-        mock_report_action_update: MagicMock,
+        job_attachment_details: JobAttachmentDetails,
     ) -> None:
-        """Tests that if a task run succeeds (the Open Job Description action), but the job attachment output
-        sync fails, the action failure is returned, and any pending actions are marked as
-        NEVER_ATTEMPTED."""
-        # GIVEN
-        current_action = CurrentAction(
-            definition=RunStepTaskAction(
-                details=StepDetails(
-                    step_template=StepTemplate(
-                        name="Test",
-                        script=StepScript(
-                            actions=StepActions(
-                                onRun=Action(
-                                    command="echo",
-                                    args=["hello"],
-                                ),
-                            ),
-                        ),
-                    ),
-                    step_id=step_id,
-                ),
-                id=action_id,
-                task_id=task_id,
-                task_parameter_values=dict[str, ParameterValue](),
-            ),
-            start_time=action_start_time,
-        )
-        session._current_action = current_action
-        queue_cancel_all: MagicMock = session_action_queue.cancel_all
-        sync_outputs_exception_msg = "syncing outputs fail message"
-        sync_outputs_exception = Exception(sync_outputs_exception_msg)
-        expected_fail_action_status = ActionStatus(
-            state=ActionState.FAILED,
-            fail_message=f"Failed to sync job output attachments for {current_action.definition.id}: {sync_outputs_exception_msg}",
-        )
-        expected_action_update = SessionActionStatus(
-            id=action_id,
-            status=expected_fail_action_status,
-            start_time=action_start_time,
-            completed_status="FAILED",
-            end_time=action_complete_time,
-        )
+        # Set up a mock output sync action
+        mocked_upload_action = MagicMock()
+        # Set up a mock output sync target action
+        output_sync_target_action = MagicMock()
 
-        def mock_now(*arg, **kwarg) -> datetime:
-            return action_complete_time
+        session._current_action = mocked_upload_action
+        session._output_sync_target_action = output_sync_target_action
+        session._job_attachment_details = job_attachment_details
+
+        # WHEN
+        # Call with a completed action status
+        completed_action_status = ActionStatus(state=ActionState.SUCCESS)
+
+        action_complete_time = datetime.now()
 
         with (
-            patch.object(session_mod, "datetime") as mock_datetime,
             patch.object(
-                session, "_sync_asset_outputs", side_effect=sync_outputs_exception
-            ) as mock_sync_asset_outputs,
+                session_mod,
+                "OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS",
+                {ActionState.SUCCESS: "SUCCEEDED"},
+            ),
+            patch.object(session, "_handle_action_update") as mocked_handle_action_upload,
         ):
-            mock_datetime.now.side_effect = mock_now
-
-            # WHEN
             session._action_updated_impl(
-                action_status=success_action_status,
+                action_status=completed_action_status,
                 now=action_complete_time,
             )
 
-        # THEN
-        mock_report_action_update.assert_called_once_with(expected_action_update)
-        queue_cancel_all.assert_called_once_with(
-            message=expected_fail_action_status.fail_message,
-            ignore_env_exits=True,
+        expected_manifest_list: list[ManifestInfo] = [{}]
+
+        mocked_handle_action_upload.assert_called_once_with(
+            False,
+            completed_action_status,
+            output_sync_target_action,
+            action_complete_time,
+            expected_manifest_list,
         )
-        assert session._current_action is None, "Current session action emptied"
-        mock_sync_asset_outputs.assert_called_once_with(current_action=current_action)
+
+    def test_success_task_run_attachment_upload_with_manifest(
+        self,
+        session: Session,
+        job_attachment_details: JobAttachmentDetails,
+    ) -> None:
+        # Set up a mock output sync action
+        mocked_upload_action = MagicMock()
+        # Set up a mock output sync target action
+        output_sync_target_action = MagicMock()
+
+        job_attachment_details.manifests.extend(
+            [
+                # Add a second asset root to the manifests. We won't get an output for this one.
+                JobAttachmentManifestProperties(root_path="no_output", root_path_format="posix"),
+                # Add a thir asset root to the manifests.
+                JobAttachmentManifestProperties(root_path="root_path2", root_path_format="posix"),
+            ]
+        )
+
+        session._current_action = mocked_upload_action
+        session._output_sync_target_action = output_sync_target_action
+        session._job_attachment_details = job_attachment_details
+        session._upload_manifest_list = [
+            # Extra manifest. It's not in job attachments details and should be
+            # omitted from the expected output.
+            UploadManifestInfo(
+                "fake_path1",
+                "fake_hash1",
+                "fake_source_path1",
+            ),
+            # Two Manifests match root paths in job attachments details
+            UploadManifestInfo(
+                "fake_path",
+                "fake_hash",
+                job_attachment_details.manifests[0].root_path,
+            ),
+            UploadManifestInfo(
+                "fake_path1",
+                "fake_hash1",
+                "root_path2",
+            ),
+        ]
+
+        # WHEN
+        # Call with a completed action status
+        completed_action_status = ActionStatus(state=ActionState.SUCCESS)
+
+        action_complete_time = datetime.now()
+
+        with (
+            patch.object(
+                session_mod,
+                "OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS",
+                {ActionState.SUCCESS: "SUCCEEDED"},
+            ),
+            patch.object(session, "_handle_action_update") as mocked_handle_action_upload,
+        ):
+            session._action_updated_impl(
+                action_status=completed_action_status,
+                now=action_complete_time,
+            )
+
+        expected_manifest_list = [
+            # manifest information for the source path that matches the root.
+            {
+                "outputManifestPath": "fake_path",
+                "outputManifestHash": "fake_hash",
+            },
+            # There was no output information for the 2nd root path. It should have an empty manifest info.
+            {},
+            # This manifest also matches a root path. We want to make sure that we're matching the order defined
+            # in job attachment details.
+            {
+                "outputManifestPath": "fake_path1",
+                "outputManifestHash": "fake_hash1",
+            },
+        ]
+
+        mocked_handle_action_upload.assert_called_once_with(
+            False,
+            completed_action_status,
+            output_sync_target_action,
+            action_complete_time,
+            expected_manifest_list,
+        )
 
     def test_logs_succeeded(
         self,
@@ -1589,10 +1382,12 @@ class TestSessionActionUpdatedImpl:
     ) -> None:
         """Tests that succeeded actions are logged"""
         # WHEN
-        session._action_updated_impl(
+        future = session._action_updated_impl(
             action_status=success_action_status,
             now=action_complete_time,
         )
+        if future:
+            wait([future])
 
         # THEN
         mock_mod_logger.info.assert_called_once()
@@ -1614,10 +1409,12 @@ class TestSessionActionUpdatedImpl:
     ) -> None:
         """Tests that failed actions are logged"""
         # WHEN
-        session._action_updated_impl(
+        future = session._action_updated_impl(
             action_status=failed_action_status,
             now=action_complete_time,
         )
+        if future:
+            wait([future])
 
         # THEN
         mock_mod_logger.info.assert_called_once()
@@ -1638,10 +1435,12 @@ class TestSessionActionUpdatedImpl:
     ) -> None:
         """Tests that canceled actions are logged"""
         # WHEN
-        session._action_updated_impl(
+        future = session._action_updated_impl(
             action_status=canceled_action_status,
             now=action_complete_time,
         )
+        if future:
+            wait([future])
 
         # THEN
         mock_mod_logger.info.assert_called_once()
@@ -1652,8 +1451,293 @@ class TestSessionActionUpdatedImpl:
         assert mock_mod_logger.info.call_args.args[0].status == "CANCELED"
         assert mock_mod_logger.info.call_args.args[0].action_id == current_action.definition.id
 
+    def test_action_output_capture_filter_integration_on_output_sync_creation(
+        self,
+        action_id: str,
+        session: Session,
+        action_start_time: datetime,
+        step_id: str,
+        success_action_status: ActionStatus,
+        task_id: str,
+        mock_action_output_log_filter: MagicMock,
+        mock_openjd_log: MagicMock,
+    ) -> None:
+        """Tests that ActionOutputCaptureFilter is properly integrated when a task run succeeds"""
+        # GIVEN
+        session._job_attachment_details = MagicMock()
 
-@pytest.mark.usefixtures("mock_openjd_session")
+        current_action = CurrentAction(
+            definition=RunStepTaskAction(
+                details=StepDetails(
+                    step_template=StepTemplate(
+                        name="Test",
+                        script=StepScript(
+                            actions=StepActions(
+                                onRun=Action(
+                                    command=CommandString("echo"),
+                                    args=[ArgString("hello")],
+                                ),
+                            ),
+                        ),
+                    ),
+                    step_id=step_id,
+                ),
+                id=action_id,
+                task_id=task_id,
+                task_parameter_values=dict[str, ParameterValue](),
+            ),
+            start_time=action_start_time,
+        )
+        session._current_action = current_action
+        mock_filter_instance = MagicMock()
+        mock_action_output_log_filter.return_value = mock_filter_instance
+
+        # WHEN
+        session._action_updated_impl(
+            action_status=success_action_status,
+            now=datetime.now(),
+        )
+
+        # THEN
+        # Verify filter was created with correct parameters
+        mock_action_output_log_filter.assert_called_once()
+        _, kwargs = mock_action_output_log_filter.call_args
+        assert kwargs["session_id"] == session.id
+        assert callable(kwargs["callback"])
+
+        # Verify filter was added to OPENJD_LOG
+        mock_openjd_log.addFilter.assert_called_once_with(mock_filter_instance)
+
+        # Verify output sync target action was set
+        assert session._output_sync_target_action == current_action
+        assert session._current_action is None
+
+    def test_action_output_filter_removed_on_output_sync_completion(
+        self,
+        session: Session,
+        mock_openjd_log: MagicMock,
+    ) -> None:
+        """Tests that ActionOutputCaptureFilter is removed when output sync completes"""
+        # GIVEN
+        # Set up a mock filter
+        mock_filter = MagicMock()
+        session._action_output_log_filter = mock_filter
+
+        # Set up a mock output sync action
+        mocked_upload_action = MagicMock()
+        # Set up a mock output sync target action
+        output_sync_target_action = MagicMock()
+
+        session._current_action = mocked_upload_action
+        session._output_sync_target_action = output_sync_target_action
+
+        # WHEN
+        # Call with a completed action status
+        completed_action_status = ActionStatus(state=ActionState.SUCCESS)
+
+        with patch.object(
+            session_mod,
+            "OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS",
+            {ActionState.SUCCESS: "SUCCEEDED"},
+        ):
+            session._action_updated_impl(
+                action_status=completed_action_status,
+                now=datetime.now(),
+            )
+
+        # THEN
+        # Verify filter was removed
+        mock_openjd_log.removeFilter.assert_called_once_with(mock_filter)
+        # Verify output sync target action was cleared
+        assert session._output_sync_target_action is None
+
+    def test_action_output_capture_filter_ja_upload_callback_invalid(
+        self,
+        session: Session,
+    ) -> None:
+        """Tests that the callback for ja_upload type correctly handles incorrectly formatted value"""
+
+        # WHEN
+        session._action_output_log_filter_callback(
+            log_config_mod.ActionOutputMessageKind.JA_UPLOAD, "NOT A VALID LIST OF MANIFEST INFOS"
+        )
+
+        assert session._upload_manifest_list == []
+
+        session._action_output_log_filter_callback(
+            log_config_mod.ActionOutputMessageKind.JA_UPLOAD, '[{"not":"real"}]'
+        )
+
+        assert session._upload_manifest_list == []
+
+    def test_action_output_capture_filter_ja_upload_callback_valid(
+        self,
+        session: Session,
+    ) -> None:
+        """Tests that the callback for ja_upload type correctly handles properly formatted value"""
+
+        # WHEN
+        session._action_output_log_filter_callback(
+            log_config_mod.ActionOutputMessageKind.JA_UPLOAD,
+            '[{"source_path": "test", "output_manifest_path":"test", "output_manifest_hash":"test"}]',
+        )
+
+        assert len(session._upload_manifest_list) == 1
+        assert all(isinstance(item, UploadManifestInfo) for item in session._upload_manifest_list)
+
+    def test_progress_update_excludes_manifests(
+        self,
+        session: Session,
+        mock_report_action_update: MagicMock,
+    ) -> None:
+        """Test that progress updates (RUNNING state) do not include manifests field"""
+        # GIVEN - A running task action with progress
+        action_id = "test-action-123"
+        step_id = "step-456"
+        task_id = "task-789"
+
+        current_action = CurrentAction(
+            definition=RunStepTaskAction(
+                details=StepDetails(
+                    step_template=StepTemplate(
+                        name="Test",
+                        script=StepScript(
+                            actions=StepActions(
+                                onRun=Action(
+                                    command=CommandString("echo"),
+                                    args=[ArgString("hello")],
+                                    cancelation=None,
+                                )
+                            )
+                        ),
+                    ),
+                    step_id=step_id,
+                ),
+                id=action_id,
+                task_id=task_id,
+                task_parameter_values=dict[str, ParameterValue](),
+            ),
+            start_time=datetime.now(tz=timezone.utc),
+        )
+        session._current_action = current_action
+
+        # Progress update (RUNNING state, no completed_status)
+        progress_action_status = ActionStatus(
+            state=ActionState.RUNNING, progress=50.0, status_message="Processing files..."
+        )
+
+        # WHEN - Progress update is reported
+        session._action_updated_impl(
+            action_status=progress_action_status,
+            now=datetime.now(tz=timezone.utc),
+        )
+
+        # THEN - No manifests field should be included
+        mock_report_action_update.assert_called_once()
+        call_args = mock_report_action_update.call_args[0][0]
+        assert isinstance(call_args, SessionActionStatus)
+        assert call_args.manifests is None  # Should be None for progress updates
+
+    def test_failed_task_excludes_manifests(
+        self,
+        session: Session,
+        mock_report_action_update: MagicMock,
+    ) -> None:
+        """Test that failed task actions do not include manifests field"""
+        # GIVEN - A failed task action
+        action_id = "test-action-123"
+        step_id = "step-456"
+        task_id = "task-789"
+
+        current_action = CurrentAction(
+            definition=RunStepTaskAction(
+                details=StepDetails(
+                    step_template=StepTemplate(
+                        name="Test",
+                        script=StepScript(
+                            actions=StepActions(
+                                onRun=Action(
+                                    command=CommandString("echo"),
+                                    args=[ArgString("hello")],
+                                    cancelation=None,
+                                )
+                            )
+                        ),
+                    ),
+                    step_id=step_id,
+                ),
+                id=action_id,
+                task_id=task_id,
+                task_parameter_values=dict[str, ParameterValue](),
+            ),
+            start_time=datetime.now(tz=timezone.utc),
+        )
+        session._current_action = current_action
+
+        # Failed action status
+        failed_action_status = ActionStatus(state=ActionState.FAILED, fail_message="Task failed")
+
+        # WHEN - Failed action is reported
+        with patch.object(
+            session_mod,
+            "OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS",
+            {ActionState.FAILED: "FAILED"},
+        ):
+            session._action_updated_impl(
+                action_status=failed_action_status,
+                now=datetime.now(tz=timezone.utc),
+            )
+
+        # THEN - No manifests field should be included
+        mock_report_action_update.assert_called_once()
+        call_args = mock_report_action_update.call_args[0][0]
+        assert isinstance(call_args, SessionActionStatus)
+        assert call_args.manifests is None  # Should be None for failed actions
+
+    def test_successful_task_without_job_attachments_includes_none_manifests(
+        self,
+        session: Session,
+        mock_report_action_update: MagicMock,
+    ) -> None:
+        """Test that manifests are None when job attachments are not used in output sync flow"""
+        # Set up a mock output sync action
+        mocked_upload_action = MagicMock()
+        # Set up a mock output sync target action
+        output_sync_target_action = MagicMock()
+
+        session._current_action = mocked_upload_action
+        session._output_sync_target_action = output_sync_target_action
+        # Explicitly set job_attachment_details to None to simulate no job attachments
+        session._job_attachment_details = None
+
+        # WHEN - Call with a completed action status
+        completed_action_status = ActionStatus(state=ActionState.SUCCESS)
+        action_complete_time = datetime.now()
+
+        with (
+            patch.object(
+                session_mod,
+                "OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS",
+                {ActionState.SUCCESS: "SUCCEEDED"},
+            ),
+            patch.object(session, "_handle_action_update") as mocked_handle_action_upload,
+        ):
+            session._action_updated_impl(
+                action_status=completed_action_status,
+                now=action_complete_time,
+            )
+
+        # THEN - manifests_list should be None when job attachments are not used
+        mocked_handle_action_upload.assert_called_once_with(
+            False,
+            completed_action_status,
+            output_sync_target_action,
+            action_complete_time,
+            None,  # manifests_list should be None when job attachments are not used
+        )
+
+
+@pytest.mark.usefixtures("mock_runtime")
 class TestStartCancelingCurrentAction:
     """Test cases for Session._start_canceling_current_action()"""
 
@@ -1904,10 +1988,10 @@ class TestSessionCleanup:
     def test_calls_openjd_cleanup(
         self,
         session: Session,
-        mock_openjd_session: MagicMock,
+        mock_runtime: MagicMock,
     ) -> None:
         # GIVEN
-        openjd_session_cleanup: MagicMock = mock_openjd_session.cleanup
+        openjd_session_cleanup: MagicMock = mock_runtime.cleanup
 
         # Mock Session._monitor_action which is used to poll the Open Job Description session status
         with patch.object(session, "_monitor_action", return_value=[]):
@@ -1917,7 +2001,7 @@ class TestSessionCleanup:
         # THEN
         openjd_session_cleanup.assert_called_once_with()
 
-    @pytest.fixture()
+    @pytest.fixture
     def mock_asset_sync(self, session: Session) -> Generator[MagicMock, None, None]:
         with patch.object(session, "_asset_sync") as mock_asset_sync:
             yield mock_asset_sync
@@ -1927,7 +2011,7 @@ class TestSessionCleanup:
         session: Session,
         job_attachment_details: JobAttachmentDetails,
         mock_asset_sync: MagicMock,
-        mock_openjd_session: MagicMock,
+        mock_runtime: MagicMock,
     ) -> None:
         # GIVEN
         mock_asset_sync_cleanup: MagicMock = mock_asset_sync.cleanup_session
@@ -1939,7 +2023,7 @@ class TestSessionCleanup:
 
         # THEN
         mock_asset_sync_cleanup.assert_called_once_with(
-            session_dir=mock_openjd_session.working_directory,
+            session_dir=mock_runtime.working_directory,
             file_system=job_attachment_details.job_attachments_file_system,
             os_user=session._os_user.user,
         )
@@ -1949,7 +2033,7 @@ class TestSessionCleanup:
         session: Session,
         job_attachment_details: JobAttachmentDetails,
         mock_asset_sync: MagicMock,
-        mock_openjd_session: MagicMock,
+        mock_runtime: MagicMock,
     ) -> None:
         # GIVEN
         mock_asset_sync_cleanup: MagicMock = mock_asset_sync.cleanup_session
@@ -1961,7 +2045,7 @@ class TestSessionCleanup:
 
         # THEN
         mock_asset_sync_cleanup.assert_called_once_with(
-            session_dir=mock_openjd_session.working_directory,
+            session_dir=mock_runtime.working_directory,
             file_system=job_attachment_details.job_attachments_file_system,
             os_user=None,
         )
@@ -2047,6 +2131,7 @@ class TestSessionStartAction:
     def test_run_action_with_env_variables(
         self,
         session: Session,
+        step_id: str,
         run_step_task_action: RunStepTaskAction,
         mock_mod_logger: MagicMock,
     ) -> None:
@@ -2074,6 +2159,7 @@ class TestSessionStartAction:
         session_run_task.call_args.kwargs["os_env_vars"] == {
             "DEADLINE_SESSIONACTION_ID": run_step_task_action.id,
             "DEADLINE_TASK_ID": run_step_task_action.task_id,
+            "DEADLINE_STEP_ID": step_id,
         }
 
     def test_enter_env_action_called_with_env_variables(
@@ -2131,3 +2217,687 @@ class TestSessionStartAction:
         session_exit_env.call_args.kwargs["os_env_vars"] == {
             "DEADLINE_SESSIONACTION_ID": exit_env_action.id,
         }
+
+    def test_session_includes_redacted_env_vars_extension(
+        self,
+        session_id: str,
+        job_details: MagicMock,
+        session_action_queue: MagicMock,
+        session_root_dir: Path,
+        os_user: SessionUser,
+        queue_id: str,
+        action_update_callback: MagicMock,
+        action_update_lock: MagicMock,
+        asset_sync: MagicMock,
+    ) -> None:
+        """Tests that the REDACTED_ENV_VARS extension is included in the supported extensions
+        This test should be updated when BatchGetJobEntity returns the list of requested extensions
+        to use those intead - Session will likely take those extensions as a parameter of some sort"""
+        # GIVEN
+        from deadline_worker_agent.sessions.session import Session
+
+        # WHEN
+        with patch("deadline_worker_agent.sessions.session.create_session_runtime") as mock_create:
+            _ = Session(
+                id=session_id,
+                job_details=job_details,
+                queue=session_action_queue,
+                queue_id=queue_id,
+                job_id="job-1234",
+                asset_sync=asset_sync,
+                session_root_dir=session_root_dir,
+                os_user=os_user,
+                action_update_callback=action_update_callback,
+                action_update_lock=action_update_lock,
+                retain_session_dir=False,
+            )
+
+        # THEN
+        # Verify that the REDACTED_ENV_VARS extension is included in the supported extensions
+        mock_create.assert_called_once()
+        config = mock_create.call_args[0][1]
+        # Check that REDACTED_ENV_VARS is in the list of extensions
+        assert ExtensionName.REDACTED_ENV_VARS.value in config.supported_extensions
+
+
+class TestSessionWorkerManifestProperties:
+    """Test cases for Session worker manifest properties dictionary functionality."""
+
+    @pytest.fixture
+    def worker_manifest_properties(self) -> WorkerManifestProperties:
+        """Fixture providing a WorkerManifestProperties instance for testing."""
+        from deadline.job_attachments.models import ManifestProperties, PathFormat
+
+        manifest_props = ManifestProperties(
+            rootPath="/source/path",
+            rootPathFormat=PathFormat.POSIX,
+            fileSystemLocationName="shared_storage",
+            inputManifestPath="input.json",
+            inputManifestHash="hash123",
+            outputRelativeDirectories=["out1", "out2"],
+        )
+
+        return WorkerManifestProperties(
+            manifest_properties=manifest_props,
+            local_root_path="/local/root",
+            local_manifest_paths=["/local/manifest.json"],
+        )
+
+    @pytest.fixture
+    def second_worker_manifest_properties(self) -> WorkerManifestProperties:
+        """Fixture providing a second WorkerManifestProperties instance for testing."""
+        from deadline.job_attachments.models import ManifestProperties, PathFormat
+
+        manifest_props = ManifestProperties(
+            rootPath="/another/source/path",
+            rootPathFormat=PathFormat.WINDOWS,
+            fileSystemLocationName="another_storage",
+            inputManifestPath="another_input.json",
+            inputManifestHash="hash456",
+            outputRelativeDirectories=["output"],
+        )
+
+        return WorkerManifestProperties(
+            manifest_properties=manifest_props,
+            local_root_path="/another/local/root",
+            local_manifest_paths=["/another/local/manifest.json"],
+        )
+
+    def test_worker_manifest_properties_dict_property_initial_state(self, session: Session):
+        """Test that worker_manifest_properties_by_local_root property returns empty dict initially."""
+        # WHEN
+        result = session.worker_manifest_properties_by_local_root
+
+        # THEN
+        assert result == {}
+
+    def test_set_worker_manifest_properties(
+        self, session: Session, worker_manifest_properties: WorkerManifestProperties
+    ):
+        """Test setting worker manifest properties in the session dictionary."""
+        # WHEN
+        session.set_worker_manifest_properties(worker_manifest_properties)
+
+        # THEN
+        assert (
+            worker_manifest_properties.local_root_path
+            in session._worker_manifest_properties_by_local_root
+        )
+        assert (
+            session._worker_manifest_properties_by_local_root[
+                worker_manifest_properties.local_root_path
+            ]
+            == worker_manifest_properties
+        )
+
+    def test_set_multiple_worker_manifest_properties(
+        self,
+        session: Session,
+        worker_manifest_properties: WorkerManifestProperties,
+        second_worker_manifest_properties: WorkerManifestProperties,
+    ):
+        """Test setting multiple worker manifest properties in the session dictionary."""
+        # WHEN
+        session.set_worker_manifest_properties(worker_manifest_properties)
+        session.set_worker_manifest_properties(second_worker_manifest_properties)
+
+        # THEN
+        assert len(session._worker_manifest_properties_by_local_root) == 2
+        assert (
+            session._worker_manifest_properties_by_local_root[
+                worker_manifest_properties.local_root_path
+            ]
+            == worker_manifest_properties
+        )
+        assert (
+            session._worker_manifest_properties_by_local_root[
+                second_worker_manifest_properties.local_root_path
+            ]
+            == second_worker_manifest_properties
+        )
+
+    def test_set_worker_manifest_properties_overwrites_existing(
+        self,
+        session: Session,
+        worker_manifest_properties: WorkerManifestProperties,
+        second_worker_manifest_properties: WorkerManifestProperties,
+    ):
+        """Test that setting worker manifest properties overwrites existing entry with same key."""
+        # GIVEN - Modify second properties to have same local_root_path as first
+        second_worker_manifest_properties.local_root_path = (
+            worker_manifest_properties.local_root_path
+        )
+        session.set_worker_manifest_properties(worker_manifest_properties)
+
+        # WHEN
+        session.set_worker_manifest_properties(second_worker_manifest_properties)
+
+        # THEN
+        assert len(session._worker_manifest_properties_by_local_root) == 1
+        assert (
+            session._worker_manifest_properties_by_local_root[
+                worker_manifest_properties.local_root_path
+            ]
+            == second_worker_manifest_properties
+        )
+
+    def test_add_local_manifest_path_existing_key(
+        self, session: Session, worker_manifest_properties: WorkerManifestProperties
+    ):
+        """Test adding local manifest path to existing worker manifest properties."""
+        # GIVEN
+        new_manifest_path = "/new/manifest/path.json"
+        session.set_worker_manifest_properties(worker_manifest_properties)
+        initial_paths = worker_manifest_properties.local_manifest_paths.copy()
+
+        # WHEN
+        returned_props = session.add_local_manifest_path(
+            worker_manifest_properties.local_root_path, new_manifest_path
+        )
+
+        # THEN
+        updated_props = session.worker_manifest_properties_by_local_root[
+            worker_manifest_properties.local_root_path
+        ]
+        assert returned_props is updated_props  # Verify return value is the same object
+        assert len(updated_props.local_manifest_paths) == len(initial_paths) + 1
+        assert new_manifest_path in updated_props.local_manifest_paths
+        assert all(path in updated_props.local_manifest_paths for path in initial_paths)
+
+    def test_add_local_manifest_path_nonexistent_key(self, session: Session):
+        """Test adding local manifest path to nonexistent key raises ValueError."""
+        # GIVEN
+        nonexistent_path = "/nonexistent/path"
+        manifest_path = "/some/manifest.json"
+
+        # WHEN / THEN
+        with pytest.raises(
+            ValueError,
+            match=f"Worker manifest properties not found for local_root_path: {nonexistent_path}",
+        ):
+            session.add_local_manifest_path(nonexistent_path, manifest_path)
+
+    def test_add_multiple_local_manifest_paths(
+        self, session: Session, worker_manifest_properties: WorkerManifestProperties
+    ):
+        """Test adding multiple local manifest paths to same worker manifest properties."""
+        # GIVEN
+        new_paths = ["/path1.json", "/path2.json", "/path3.json"]
+        session.set_worker_manifest_properties(worker_manifest_properties)
+        initial_count = len(worker_manifest_properties.local_manifest_paths)
+
+        # WHEN
+        returned_props_list = []
+        for path in new_paths:
+            returned_props = session.add_local_manifest_path(
+                worker_manifest_properties.local_root_path, path
+            )
+            returned_props_list.append(returned_props)
+
+            # THEN
+            updated_props = session.worker_manifest_properties_by_local_root[
+                worker_manifest_properties.local_root_path
+            ]
+            assert returned_props is updated_props
+            assert path in updated_props.local_manifest_paths
+
+        # THEN
+        updated_props = session.worker_manifest_properties_by_local_root[
+            worker_manifest_properties.local_root_path
+        ]
+        assert len(updated_props.local_manifest_paths) == initial_count + len(new_paths)
+
+    def test_worker_manifest_properties_dict_property_reflects_changes(
+        self, session: Session, worker_manifest_properties: WorkerManifestProperties
+    ):
+        """Test that worker_manifest_properties_by_local_root property reflects changes made to internal dict."""
+        # WHEN
+        session.set_worker_manifest_properties(worker_manifest_properties)
+        result = session.worker_manifest_properties_by_local_root
+
+        # THEN
+        assert result == {worker_manifest_properties.local_root_path: worker_manifest_properties}
+        assert (
+            result is session._worker_manifest_properties_by_local_root
+        )  # Should return the same reference
+
+    def test_worker_manifest_properties_integration_workflow(
+        self,
+        session: Session,
+        worker_manifest_properties: WorkerManifestProperties,
+        second_worker_manifest_properties: WorkerManifestProperties,
+    ):
+        """Test a complete workflow of setting, getting, and modifying worker manifest properties."""
+        # GIVEN
+        additional_manifest_path = "/additional/manifest.json"
+
+        # WHEN - Set initial properties
+        session.set_worker_manifest_properties(worker_manifest_properties)
+        session.set_worker_manifest_properties(second_worker_manifest_properties)
+
+        # WHEN - Add manifest path to first properties
+        returned_props = session.add_local_manifest_path(
+            worker_manifest_properties.local_root_path, additional_manifest_path
+        )
+
+        # WHEN - Get all properties
+        properties_dict = session.worker_manifest_properties_by_local_root
+
+        # THEN - Verify all operations worked correctly
+        assert len(properties_dict) == 2
+        assert (
+            returned_props is properties_dict[worker_manifest_properties.local_root_path]
+        )  # Verify return value is correct
+        assert (
+            additional_manifest_path
+            in properties_dict[worker_manifest_properties.local_root_path].local_manifest_paths
+        )
+        assert (
+            additional_manifest_path
+            not in properties_dict[
+                second_worker_manifest_properties.local_root_path
+            ].local_manifest_paths
+        )
+
+    def test_worker_manifest_properties_with_empty_local_manifest_paths(self, session: Session):
+        """Test worker manifest properties functionality with empty local_manifest_paths."""
+        from deadline.job_attachments.models import ManifestProperties, PathFormat
+
+        # GIVEN
+        manifest_props = ManifestProperties(
+            rootPath="/source/path",
+            rootPathFormat=PathFormat.POSIX,
+        )
+
+        worker_props = WorkerManifestProperties(
+            manifest_properties=manifest_props,
+            local_root_path="/local/root",
+            # local_manifest_paths defaults to empty list
+        )
+
+        # WHEN
+        session.set_worker_manifest_properties(worker_props)
+        session.add_local_manifest_path(worker_props.local_root_path, "/first/manifest.json")
+        session.add_local_manifest_path(worker_props.local_root_path, "/second/manifest.json")
+
+        # THEN
+        result = session.worker_manifest_properties_by_local_root[worker_props.local_root_path]
+        assert sorted(result.local_manifest_paths) == [
+            "/first/manifest.json",
+            "/second/manifest.json",
+        ]
+
+
+class TestRunAttachmentSyncTask:
+    """Test cases for Session._run_attachment_sync_task()
+
+    This method is a thin wrapper around _run_task_without_session_env, so we only test
+    that it correctly delegates to the underlying method with the right parameters.
+    """
+
+    @pytest.mark.parametrize(
+        "os_env_vars,log_task_banner",
+        [
+            (None, True),
+            ({"ENV_VAR1": "value1", "ENV_VAR2": "value2"}, True),
+            (None, False),
+            ({"ENV_VAR1": "value1"}, False),
+        ],
+        ids=["defaults", "with_env_vars", "no_banner", "all_params"],
+    )
+    def test_delegates_to_run_task_without_session_env(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+        os_env_vars: dict[str, str] | None,
+        log_task_banner: bool,
+    ) -> None:
+        """Tests that _run_attachment_sync_task correctly delegates to _run_task_without_session_env."""
+        # GIVEN
+        step_script_model = MagicMock()
+
+        # WHEN
+        session._run_attachment_sync_task(
+            step_script=step_script_model,
+            task_parameter_values=dict[str, ParameterValue](),
+            os_env_vars=os_env_vars,
+            log_task_banner=log_task_banner,
+        )
+
+        # THEN
+        mock_runtime._run_task_without_session_env.assert_called_once_with(
+            step_script=step_script_model,
+            task_parameter_values=dict[str, ParameterValue](),
+            os_env_vars=os_env_vars,
+            log_task_banner=log_task_banner,
+        )
+
+    def test_propagates_exception_from_openjd_session(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+    ) -> None:
+        """Tests that exceptions from the underlying Open Job Description session are propagated."""
+        # GIVEN
+        expected_exception = RuntimeError("Task execution failed")
+        mock_runtime._run_task_without_session_env.side_effect = expected_exception
+
+        # WHEN / THEN
+        with pytest.raises(RuntimeError) as exc_info:
+            session._run_attachment_sync_task(
+                step_script=MagicMock(),
+                task_parameter_values={},
+            )
+
+        assert exc_info.value is expected_exception
+
+
+class TestRunTask:
+    """Session.run_task is a pass-through to the configured runtime.
+
+    The resolved symbol table is the only channel carrying step-scope EXPR
+    `let` values, so its forwarding is what pins those names reaching the
+    task's symbol table.
+    """
+
+    @pytest.mark.parametrize(
+        "resolved_symbol_table_json",
+        [
+            None,
+            '[{"name":"region","type":"string","value":"us-west-2"}]',
+            '[{"name":"a","type":"int","value":"1"},{"name":"b","type":"int","value":"2"}]',
+        ],
+        ids=["none", "single", "multiple_dependent"],
+    )
+    def test_forwards_resolved_symbol_table_json_to_runtime(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+        resolved_symbol_table_json: str | None,
+    ) -> None:
+        # GIVEN
+        step_script_model = MagicMock()
+
+        # WHEN
+        session.run_task(
+            step_script=step_script_model,
+            task_parameter_values=dict[str, ParameterValue](),
+            resolved_symbol_table_json=resolved_symbol_table_json,
+        )
+
+        # THEN
+        assert (
+            mock_runtime.run_task.call_args.kwargs["resolved_symbol_table_json"]
+            is resolved_symbol_table_json
+        )
+
+
+class TestRuntimeCrashTelemetry:
+    """A SessionRuntimeCrashError surfacing from an action start (WA-7: e.g. a
+    Rust panic converted at the adapter boundary) must emit a runtime_failure
+    telemetry event; ordinary exceptions must not."""
+
+    @pytest.fixture
+    def crash_session(
+        self,
+        asset_sync: MagicMock,
+        job_details: JobDetails,
+        session_action_queue: MagicMock,
+        action_update_lock: MagicMock,
+        session_root_dir: Path,
+        mock_runtime: MagicMock,
+    ) -> Session:
+        return Session(
+            id="session-crash0123456789abcdef01234567",
+            asset_sync=asset_sync,
+            env=None,
+            job_details=job_details,
+            os_user=None,
+            queue=session_action_queue,
+            queue_id="queue-abcdef0123456789abcdef0123456789",
+            job_id="job-1234",
+            action_update_callback=MagicMock(),
+            action_update_lock=action_update_lock,
+            session_root_dir=session_root_dir,
+            session_runtime_kind=SessionRuntimeKind.RUST,
+            farm_id="farm-abcdef0123456789abcdef0123456789",
+            region="us-west-2",
+        )
+
+    def _dequeued_action_raising(self, exc: Exception) -> MagicMock:
+        action = MagicMock()
+        action.start.side_effect = exc
+        action.task_id = None
+        return action
+
+    def test_runtime_crash_emits_failure_telemetry(
+        self, crash_session: Session, session_action_queue: MagicMock
+    ) -> None:
+        from deadline_worker_agent.sessions.runtime._abc import SessionRuntimeCrashError
+
+        crash = SessionRuntimeCrashError("session runtime crashed: PanicException")
+        crash.__cause__ = BaseException("panicked")
+        session_action_queue.dequeue.return_value = self._dequeued_action_raising(crash)
+
+        with patch.object(session_mod, "record_runtime_failure_telemetry_event") as mock_telemetry:
+            crash_session._start_action()
+
+        mock_telemetry.assert_called_once()
+        kwargs = mock_telemetry.call_args.kwargs
+        assert kwargs["runtime_kind"] == "rust"
+        assert kwargs["failure_reason"] == "runtime crash"
+        assert kwargs["exception_type"] == "BaseException"
+        assert kwargs["session_id"] == "session-crash0123456789abcdef01234567"
+        assert kwargs["queue_id"] == "queue-abcdef0123456789abcdef0123456789"
+        assert kwargs["farm_id"] == "farm-abcdef0123456789abcdef0123456789"
+        assert kwargs["region"] == "us-west-2"
+
+    def test_ordinary_exception_does_not_emit_failure_telemetry(
+        self, crash_session: Session, session_action_queue: MagicMock
+    ) -> None:
+        session_action_queue.dequeue.return_value = self._dequeued_action_raising(
+            ValueError("ordinary failure")
+        )
+
+        with patch.object(session_mod, "record_runtime_failure_telemetry_event") as mock_telemetry:
+            crash_session._start_action()
+
+        mock_telemetry.assert_not_called()
+
+
+class TestResolvedSymbolTableForwarding:
+    """Tests for resolved_symbol_table_json forwarding through the session layer."""
+
+    def test_exit_environment_forwards_supplied_table_to_runtime(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+    ) -> None:
+        """Session.exit_environment forwards a supplied table to the runtime."""
+        table = '[{"name":"Job.Name","type":"string","value":"Outer"}]'
+        # Set up an active environment to exit
+        from deadline_worker_agent.sessions.session import ActiveEnvironment
+
+        session._active_envs.append(
+            ActiveEnvironment(
+                job_env_id="env-1",
+                session_env_id="session-env-1",
+                resolved_symbol_table_json='[{"name":"Job.Name","type":"string","value":"Stale"}]',
+            )
+        )
+
+        session.exit_environment(
+            job_env_id="env-1",
+            resolved_symbol_table_json=table,
+        )
+
+        mock_runtime.exit_environment.assert_called_once_with(
+            identifier="session-env-1",
+            os_env_vars=None,
+            resolved_symbol_table_json=table,
+        )
+
+    def test_exit_environment_falls_back_to_enter_time_table(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+    ) -> None:
+        """Session.exit_environment uses the stored enter-time table when supplied value is None."""
+        enter_table = '[{"name":"Job.Name","type":"string","value":"Outer"}]'
+        from deadline_worker_agent.sessions.session import ActiveEnvironment
+
+        session._active_envs.append(
+            ActiveEnvironment(
+                job_env_id="env-1",
+                session_env_id="session-env-1",
+                resolved_symbol_table_json=enter_table,
+            )
+        )
+
+        session.exit_environment(
+            job_env_id="env-1",
+            resolved_symbol_table_json=None,
+        )
+
+        mock_runtime.exit_environment.assert_called_once_with(
+            identifier="session-env-1",
+            os_env_vars=None,
+            resolved_symbol_table_json=enter_table,
+        )
+
+    def test_exit_environment_supplied_table_takes_precedence(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+    ) -> None:
+        """A supplied table takes precedence over the stored enter-time table."""
+        enter_table = '[{"name":"Job.Name","type":"string","value":"EnterTime"}]'
+        exit_table = '[{"name":"Job.Name","type":"string","value":"ExitTime"}]'
+        from deadline_worker_agent.sessions.session import ActiveEnvironment
+
+        session._active_envs.append(
+            ActiveEnvironment(
+                job_env_id="env-1",
+                session_env_id="session-env-1",
+                resolved_symbol_table_json=enter_table,
+            )
+        )
+
+        session.exit_environment(
+            job_env_id="env-1",
+            resolved_symbol_table_json=exit_table,
+        )
+
+        mock_runtime.exit_environment.assert_called_once_with(
+            identifier="session-env-1",
+            os_env_vars=None,
+            resolved_symbol_table_json=exit_table,
+        )
+
+    def test_enter_environment_stores_table_on_active_environment(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+    ) -> None:
+        """Successful enter_environment stores the table on the appended ActiveEnvironment."""
+        table = '[{"name":"Job.Name","type":"string","value":"Outer"}]'
+        mock_runtime.enter_environment.return_value = "session-env-1"
+
+        session.enter_environment(
+            job_env_id="env-1",
+            environment=MagicMock(),
+            resolved_symbol_table_json=table,
+        )
+
+        assert len(session._active_envs) == 1
+        assert session._active_envs[0].resolved_symbol_table_json == table
+
+    def test_enter_environment_forwards_step_let_declarations_to_runtime(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+    ) -> None:
+        """Session.enter_environment forwards step-scope let declarations to the
+        runtime so the Rust adapter can restore them on the lifted environment."""
+        mock_runtime.enter_environment.return_value = "session-env-1"
+
+        session.enter_environment(
+            job_env_id="env-1",
+            environment=MagicMock(),
+            step_let_declarations=["label = 'vstudio'"],
+        )
+
+        assert mock_runtime.enter_environment.call_args.kwargs["step_let_declarations"] == [
+            "label = 'vstudio'"
+        ]
+
+    def test_cleanup_forwards_stored_tables_in_reverse_order(
+        self,
+        session: Session,
+        mock_runtime: MagicMock,
+    ) -> None:
+        """_cleanup forwards each environment's own stored table and preserves reverse order."""
+        outer_table = '[{"name":"Job.Name","type":"string","value":"Outer"}]'
+        inner_table = '[{"name":"Job.Name","type":"string","value":"Inner"}]'
+        from deadline_worker_agent.sessions.session import ActiveEnvironment
+
+        session._active_envs = [
+            ActiveEnvironment(
+                job_env_id="env-outer",
+                session_env_id="session-env-outer",
+                resolved_symbol_table_json=outer_table,
+            ),
+            ActiveEnvironment(
+                job_env_id="env-inner",
+                session_env_id="session-env-inner",
+                resolved_symbol_table_json=inner_table,
+            ),
+        ]
+
+        # Mock _monitor_action so cleanup can run without blocking
+        with patch.object(session, "_monitor_action", return_value=[]):
+            session._cleanup()
+
+        # exit_environment should be called inner-most first, then outer
+        calls = mock_runtime.exit_environment.call_args_list
+        assert len(calls) == 2
+        # First call: inner environment with inner table
+        assert calls[0].kwargs["identifier"] == "session-env-inner"
+        assert calls[0].kwargs["resolved_symbol_table_json"] == inner_table
+        # Second call: outer environment with outer table
+        assert calls[1].kwargs["identifier"] == "session-env-outer"
+        assert calls[1].kwargs["resolved_symbol_table_json"] == outer_table
+
+    def test_init_passes_resolved_symbol_table_json_to_runtime_config(
+        self,
+        asset_sync: MagicMock,
+        job_details: "JobDetails",
+        os_user: "SessionUser | None",
+        mock_create_runtime: MagicMock,
+        queue_id: str,
+        session_action_queue: MagicMock,
+        action_update_callback: MagicMock,
+        action_update_lock: MagicMock,
+        session_root_dir: Path,
+    ) -> None:
+        """Session.__init__ passes the resolved_symbol_table_json into SessionRuntimeConfig."""
+        table = '[{"name":"Job.Name","type":"string","value":"SessionLevel"}]'
+
+        Session(
+            id="session-symtab-test",
+            asset_sync=asset_sync,
+            env=None,
+            job_details=job_details,
+            os_user=os_user,
+            queue=session_action_queue,
+            queue_id=queue_id,
+            job_id="job-1234",
+            action_update_callback=action_update_callback,
+            action_update_lock=action_update_lock,
+            session_root_dir=session_root_dir,
+            resolved_symbol_table_json=table,
+        )
+
+        mock_create_runtime.assert_called_once()
+        config = mock_create_runtime.call_args[0][1]
+        assert config.resolved_symbol_table_json == table

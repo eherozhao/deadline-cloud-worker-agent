@@ -26,8 +26,14 @@ from openjd.sessions import ActionState, ActionStatus, SessionUser
 from openjd.sessions import LOG as OPENJD_SESSION_LOG
 from deadline.job_attachments.asset_sync import AssetSync
 
-from ..aws.deadline import update_worker
+from ..aws.deadline import (
+    update_worker,
+    record_runtime_selection_telemetry_event,
+    record_runtime_failure_telemetry_event,
+)
 from ..aws_credentials import QueueBoto3Session, AwsCredentialsRefresher
+from .._session_runtime_kind import SessionRuntimeKind
+from ..sessions.runtime import select_runtime
 from ..boto import DeadlineClient, Session as BotoSession
 from ..errors import ServiceShutdown
 from ..sessions import JobEntities, Session
@@ -45,7 +51,7 @@ from ..api_models import (
     WorkerStatus,
     EnvironmentAction,
     TaskRunAction,
-    SyncInputJobAttachmentsAction,
+    AttachmentDownloadAction,
 )
 from ..aws.deadline import (
     DeadlineRequestConditionallyRecoverableError,
@@ -55,10 +61,7 @@ from ..aws.deadline import (
     DeadlineRequestUnrecoverableError,
     update_worker_schedule,
 )
-from .log import LOGGER
-from .session_cleanup import SessionUserCleanupManager
-from .session_queue import SessionActionQueue, SessionActionStatus
-from ..startup.config import JobsRunAsUserOverride
+from ..config import JobsRunAsUserOverride
 from ..utils import MappingWithCallbacks
 from ..file_system_operations import FileSystemPermissionEnum, make_directory, touch_file
 from ..log_messages import (
@@ -71,6 +74,9 @@ from ..log_messages import (
     WorkerLogEvent,
     WorkerLogEventOp,
 )
+from .log import LOGGER
+from .session_cleanup import SessionUserCleanupManager
+from .session_queue import SessionActionQueue, SessionActionStatus
 
 if sys.platform == "win32":
     from ..windows.win_credentials_resolver import WindowsCredentialsResolver
@@ -128,12 +134,18 @@ class QueueAwsCredentials:
 
 class SessionMap(MappingWithCallbacks[str, SchedulerSession]):
     """
-    Map of session IDs to sessions.
+    Singleton mapping of session IDs to sessions.
 
     This class hooks into dict operations to register session with SessionCleanupManager
     """
 
+    __session_map_instance: SessionMap | None = None
     _session_cleanup_manager: SessionUserCleanupManager
+
+    def __new__(cls, *args, **kwargs) -> SessionMap:
+        if cls.__session_map_instance is None:
+            cls.__session_map_instance = super().__new__(cls)
+        return cls.__session_map_instance
 
     def __init__(
         self,
@@ -160,6 +172,10 @@ class SessionMap(MappingWithCallbacks[str, SchedulerSession]):
             return
         self._session_cleanup_manager.deregister(scheduler_session.session)
 
+    @classmethod
+    def get_session_map(cls) -> SessionMap | None:
+        return cls.__session_map_instance
+
 
 class WorkerScheduler:
     _INITIAL_POLL_INTERVAL = timedelta(seconds=15)
@@ -182,6 +198,8 @@ class WorkerScheduler:
     _worker_persistence_dir: Path
     _worker_logs_dir: Path | None
     _retain_session_dir: bool
+    _session_runtime_kind: SessionRuntimeKind
+    _session_root_dir: Path
 
     # Map from queueId -> QueueAwsCredentials.
     _queue_aws_credentials: dict[str, QueueAwsCredentials]
@@ -201,7 +219,9 @@ class WorkerScheduler:
         cleanup_session_user_processes: bool,
         worker_persistence_dir: Path,
         worker_logs_dir: Path | None,
+        session_root_dir: Path,
         retain_session_dir: bool = False,
+        session_runtime_kind: SessionRuntimeKind = SessionRuntimeKind.PYTHON,
         stop: Event | None = None,
     ) -> None:
         """Queue of Worker Sessions and their actions
@@ -219,7 +239,10 @@ class WorkerScheduler:
             If the value is None, then no local session logs will be written.
         """
         self._deadline = deadline
-        self._executor = ThreadPoolExecutor(max_workers=100)
+        self._executor = ThreadPoolExecutor(
+            max_workers=100,
+            thread_name_prefix="WorkerSchedulerSessions",
+        )
         self._sessions = SessionMap(cleanup_session_user_processes=cleanup_session_user_processes)
         self._wakeup = Event()
         self._shutdown = stop or Event()
@@ -237,7 +260,9 @@ class WorkerScheduler:
         self._worker_persistence_dir = worker_persistence_dir
         self._worker_logs_dir = worker_logs_dir
         self._retain_session_dir = retain_session_dir
+        self._session_runtime_kind = session_runtime_kind
         self._windows_credentials_resolver: Optional[WindowsCredentialsResolver]
+        self._session_root_dir = session_root_dir
 
         if os.name == "nt" and not (
             self._job_run_as_user_override.job_user or self._job_run_as_user_override.run_as_agent
@@ -472,6 +497,7 @@ class WorkerScheduler:
         # fast to get to transitioning to STOPPED state after this.
         timeout_event = Event()
         timer = Timer(interval=timeout.total_seconds(), function=timeout_event.set)
+        timer.name = "UpdateWorkerStoppingTimeout"
 
         try:
             update_worker(
@@ -589,6 +615,10 @@ class WorkerScheduler:
                 updated_action["progressPercent"] = min(max(0, action_updated.status.progress), 100)
         if action_updated.end_time:
             updated_action["endedAt"] = action_updated.end_time
+
+        # Add manifest information if available
+        if action_updated.manifests is not None:
+            updated_action["manifests"] = action_updated.manifests
 
         # Truncate message to max bytes allowed by UpdateWorkerSchedule API
         if (
@@ -957,28 +987,68 @@ class WorkerScheduler:
             queue.replace(actions=session_spec["sessionActions"])
 
             os_user: Optional[SessionUser] = None
-            try:
-                os_user = self._determine_user_for_session(
-                    host_is_posix=os.name == "posix",
-                    job_run_as_user=job_details.job_run_as_user,
-                    job_run_as_user_override=self._job_run_as_user_override,
-                    queue_id=queue_id,
-                    job_id=job_id,
-                    session_id=new_session_id,
-                )
-            except ValueError as e:
-                message = str(e)
-                self._fail_all_actions(session_spec, message)
-                logger.error(
-                    SessionLogEvent(
-                        subtype=SessionLogEventSubtype.USER,
+
+            # Resolve domain user credentials from Secrets Manager if configured as a config override.
+            # This takes precedence over the queue-configured user.
+            _domain_settings = getattr(
+                self._job_run_as_user_override, "windows_user_settings", None
+            )
+            if (
+                os.name == "nt"
+                and not self._job_run_as_user_override.run_as_agent
+                and self._windows_credentials_resolver is not None
+                and _domain_settings is not None
+            ):
+                try:
+                    os_user = self._windows_credentials_resolver.get_windows_session_user(
+                        _domain_settings.user, _domain_settings.password_arn
+                    )
+                    logger.info(
+                        SessionLogEvent(
+                            subtype=SessionLogEventSubtype.USER,
+                            queue_id=queue_id,
+                            job_id=job_id,
+                            session_id=new_session_id,
+                            user=_domain_settings.user,
+                            message="Running as host-configured domain user override.",
+                        )
+                    )
+                except Exception as e:
+                    message = f"Failed to resolve credentials for domain user '{_domain_settings.user}': {e}"
+                    self._fail_all_actions(session_spec, message)
+                    logger.error(
+                        SessionLogEvent(
+                            subtype=SessionLogEventSubtype.USER,
+                            queue_id=queue_id,
+                            job_id=job_id,
+                            session_id=new_session_id,
+                            message=message,
+                        )
+                    )
+                    continue
+            else:
+                try:
+                    os_user = self._determine_user_for_session(
+                        host_is_posix=os.name == "posix",
+                        job_run_as_user=job_details.job_run_as_user,
+                        job_run_as_user_override=self._job_run_as_user_override,
                         queue_id=queue_id,
                         job_id=job_id,
                         session_id=new_session_id,
-                        message=message,
                     )
-                )
-                continue
+                except ValueError as e:
+                    message = str(e)
+                    self._fail_all_actions(session_spec, message)
+                    logger.error(
+                        SessionLogEvent(
+                            subtype=SessionLogEventSubtype.USER,
+                            queue_id=queue_id,
+                            job_id=job_id,
+                            session_id=new_session_id,
+                            message=message,
+                        )
+                    )
+                    continue
 
             queue_credentials: QueueAwsCredentials | None = None
             asset_sync: AssetSync | None = None
@@ -1080,6 +1150,10 @@ class WorkerScheduler:
                 "DEADLINE_FLEET_ID": self._fleet_id,
                 "DEADLINE_WORKER_ID": self._worker_id,
             }
+            # Expose job attachment bucket for plugin delivery mechanisms
+            if job_details.job_attachment_settings:
+                env["DEADLINE_JA_S3_BUCKET"] = job_details.job_attachment_settings.s3_bucket_name
+                env["DEADLINE_JA_ROOT_PREFIX"] = job_details.job_attachment_settings.root_prefix
             if queue_credentials:
                 env.update(
                     {
@@ -1093,19 +1167,124 @@ class WorkerScheduler:
 
             logger.debug("env = \n%s", json.dumps(env, indent=2))
 
-            session = Session(
-                id=new_session_id,
-                queue=queue,
-                queue_id=queue_id,
-                job_id=job_id,
-                env=env,
-                asset_sync=asset_sync,
-                job_details=job_details,
-                os_user=os_user,
-                retain_session_dir=self._retain_session_dir,
-                action_update_callback=self._handle_session_action_update,
-                action_update_lock=self._action_update_lock,
+            runtime_hint = (session_spec.get("metadata") or {}).get("runtimeHint")
+            try:
+                runtime_kind = select_runtime(self._session_runtime_kind, runtime_hint=runtime_hint)
+            except ValueError as e:
+                # An unknown runtimeHint indicates version skew or a
+                # service-side bug. Fail this session's actions visibly and
+                # continue; it must not take down the scheduler.
+                message = f"Failed to select session runtime: {e}"
+                self._fail_all_actions(session_spec, message)
+                logger.error(
+                    SessionLogEvent(
+                        subtype=SessionLogEventSubtype.FAILED,
+                        queue_id=queue_id,
+                        job_id=job_id,
+                        session_id=new_session_id,
+                        message=message,
+                    )
+                )
+                record_runtime_failure_telemetry_event(
+                    runtime_kind="unknown",
+                    # Constant reason: the offending value is already carried
+                    # verbatim in the runtime_hint field, and free exception
+                    # text must not reach telemetry.
+                    failure_reason="invalid runtimeHint",
+                    exception_type=type(e).__name__,
+                    runtime_hint=runtime_hint,
+                    session_id=new_session_id,
+                    queue_id=queue_id,
+                    farm_id=self._farm_id,
+                    region=self._boto_session.region_name,
+                )
+                continue
+
+            logger.info(
+                SessionLogEvent(
+                    subtype=SessionLogEventSubtype.STARTING,
+                    queue_id=queue_id,
+                    job_id=job_id,
+                    session_id=new_session_id,
+                    message=(
+                        f"Selected session runtime: {runtime_kind.value} (hint={runtime_hint!r})"
+                    ),
+                )
             )
+            record_runtime_selection_telemetry_event(
+                runtime_kind=runtime_kind.value,
+                selection_reason=(
+                    "hint"
+                    if self._session_runtime_kind is SessionRuntimeKind.SERVICE_SELECTED
+                    and runtime_hint is not None
+                    else "config-default"
+                ),
+                session_runtime_config=self._session_runtime_kind.value,
+                runtime_hint=runtime_hint,
+                session_id=new_session_id,
+                queue_id=queue_id,
+                farm_id=self._farm_id,
+                region=self._boto_session.region_name,
+            )
+
+            resolved_symbol_table_json = queue.peek_resolved_symbol_table_json()
+
+            try:
+                session = Session(
+                    id=new_session_id,
+                    queue=queue,
+                    queue_id=queue_id,
+                    job_id=job_id,
+                    env=env,
+                    asset_sync=asset_sync,
+                    job_details=job_details,
+                    os_user=os_user,
+                    retain_session_dir=self._retain_session_dir,
+                    session_runtime_kind=runtime_kind,
+                    action_update_callback=self._handle_session_action_update,
+                    action_update_lock=self._action_update_lock,
+                    session_root_dir=self._session_root_dir,
+                    farm_id=self._farm_id,
+                    region=self._boto_session.region_name,
+                    resolved_symbol_table_json=resolved_symbol_table_json,
+                )
+            except (ValueError, NotImplementedError, OSError) as e:
+                # Runtime construction can fail per-session (e.g. the selected runtime's
+                # adapter is unavailable on this host). Fail this session's actions visibly
+                # and continue; do not take down the scheduler. Unexpected exception types
+                # still propagate.
+                message = f"Failed to create session: {e}"
+                self._fail_all_actions(session_spec, message)
+                logger.error(
+                    SessionLogEvent(
+                        subtype=SessionLogEventSubtype.FAILED,
+                        queue_id=queue_id,
+                        job_id=job_id,
+                        session_id=new_session_id,
+                        message=message,
+                    )
+                )
+                record_runtime_failure_telemetry_event(
+                    runtime_kind=runtime_kind.value,
+                    # Exception messages are free text and can embed filesystem paths
+                    # (potential PII) — e.g. hand-raised OSError(f"...{path}") has
+                    # strerror=None. Never forward str(e): send OS-level strerror when
+                    # present (error class, no path), otherwise a coarse constant.
+                    # exception_type carries the class; full detail remains in the
+                    # worker log, reachable via session_id.
+                    failure_reason=(
+                        e.strerror
+                        if isinstance(e, OSError) and e.strerror
+                        else "session construction failed"
+                    ),
+                    exception_type=type(e).__name__,
+                    runtime_hint=runtime_hint,
+                    session_id=new_session_id,
+                    queue_id=queue_id,
+                    farm_id=self._farm_id,
+                    region=self._boto_session.region_name,
+                )
+                continue
 
             def run_session(
                 session: Session, queue_credentials: QueueAwsCredentials | None
@@ -1352,7 +1531,7 @@ class WorkerScheduler:
         self,
         *,
         assigned_session_actions: list[
-            EnvironmentAction | TaskRunAction | SyncInputJobAttachmentsAction
+            EnvironmentAction | TaskRunAction | AttachmentDownloadAction
         ],
         failure_message: str,
     ) -> None:

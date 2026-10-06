@@ -13,7 +13,8 @@ from openjd.sessions import ActionState, ActionStatus
 
 from ..api_models import (
     EnvironmentAction as EnvironmentActionApiModel,
-    SyncInputJobAttachmentsAction as SyncInputJobAttachmentsActionApiModel,
+    AttachmentDownloadAction as AttachmentDownloadActionApiModel,
+    AttachmentUploadAction as AttachmentUploadActionApiModel,
     TaskRunAction as TaskRunActionApiModel,
     EntityIdentifier,
     EnvironmentDetailsIdentifier,
@@ -28,7 +29,8 @@ from ..sessions.actions import (
     ExitEnvironmentAction,
     RunStepTaskAction,
     SessionActionDefinition,
-    SyncInputJobAttachmentsAction,
+    AttachmentUploadAction,
+    AttachmentDownloadAction,
 )
 from .session_action_status import SessionActionStatus
 from ..sessions.errors import (
@@ -44,7 +46,11 @@ if TYPE_CHECKING:
     from ..sessions.job_entities import JobEntities
 
     D = TypeVar(
-        "D", EnvironmentActionApiModel, TaskRunActionApiModel, SyncInputJobAttachmentsActionApiModel
+        "D",
+        EnvironmentActionApiModel,
+        TaskRunActionApiModel,
+        AttachmentDownloadActionApiModel,
+        AttachmentUploadActionApiModel,
     )
 else:
     D = TypeVar("D")
@@ -54,6 +60,25 @@ else:
 
 
 logger = getLogger(__name__)
+
+_STEP_ENVIRONMENT_ID_PREFIX = "STEP:"
+
+
+def _step_id_from_environment_id(environment_id: str) -> str | None:
+    """Extract the step id from a step-scoped environment id.
+
+    Environment ids are scope-prefixed and carry their scope's id, as in
+    ``STEP:step-<uuid>:<environment name>`` or ``JOB:job-<uuid>:<name>``.
+    Returns None for anything that is not step-scoped, so job-scoped
+    environments are never given a step's context.
+    """
+    if not environment_id.startswith(_STEP_ENVIRONMENT_ID_PREFIX):
+        return None
+    remainder = environment_id[len(_STEP_ENVIRONMENT_ID_PREFIX) :]
+    step_id, separator, _ = remainder.partition(":")
+    if not separator or not step_id:
+        return None
+    return step_id
 
 
 @dataclass(frozen=True)
@@ -67,9 +92,10 @@ class SessionActionQueueEntry(Generic[D]):
 
 EnvironmentQueueEntry = SessionActionQueueEntry[EnvironmentActionApiModel]
 TaskRunQueueEntry = SessionActionQueueEntry[TaskRunActionApiModel]
-SyncInputJobAttachmentsQueueEntry = SessionActionQueueEntry[SyncInputJobAttachmentsActionApiModel]
-SyncInputJobAttachmentsStepDependenciesQueueEntry = SessionActionQueueEntry[
-    SyncInputJobAttachmentsActionApiModel
+AttachmentUploadActionQueueEntry = SessionActionQueueEntry[AttachmentUploadActionApiModel]
+AttachmentDownloadActionQueueEntry = SessionActionQueueEntry[AttachmentDownloadActionApiModel]
+AttachmentDownloadActionStepDependenciesQueueEntry = SessionActionQueueEntry[
+    AttachmentDownloadActionApiModel
 ]
 CancelOutcome = Literal["FAILED", "NEVER_ATTEMPTED"]
 
@@ -89,15 +115,17 @@ class SessionActionQueue:
     _actions: list[
         EnvironmentQueueEntry
         | TaskRunQueueEntry
-        | SyncInputJobAttachmentsQueueEntry
-        | SyncInputJobAttachmentsStepDependenciesQueueEntry
+        | AttachmentUploadActionQueueEntry
+        | AttachmentDownloadActionQueueEntry
+        | AttachmentDownloadActionStepDependenciesQueueEntry
     ]
     _actions_by_id: dict[
         str,
         EnvironmentQueueEntry
         | TaskRunQueueEntry
-        | SyncInputJobAttachmentsQueueEntry
-        | SyncInputJobAttachmentsStepDependenciesQueueEntry,
+        | AttachmentUploadActionQueueEntry
+        | AttachmentDownloadActionQueueEntry
+        | AttachmentDownloadActionStepDependenciesQueueEntry,
     ]
     _action_update_callback: Callable[[SessionActionStatus], None]
     _job_entities: JobEntities
@@ -156,7 +184,8 @@ class SessionActionQueue:
                     ),
                 )
             elif action_type == "SYNC_INPUT_JOB_ATTACHMENTS":
-                action_definition = cast(SyncInputJobAttachmentsActionApiModel, action_definition)
+                action_definition = cast(AttachmentDownloadActionApiModel, action_definition)
+
                 if "stepId" in action_definition:
                     identifier = StepDetailsIdentifier(
                         stepDetails=StepDetailsIdentifierFields(
@@ -266,21 +295,49 @@ class SessionActionQueue:
                 )
             )
 
+    def insert_front(
+        self,
+        *,
+        action: AttachmentUploadActionApiModel,
+    ) -> None:
+        """Inserts an attachment upload action at the front of the queue
+
+        Parameters
+        ----------
+        action : AttachmentUploadActionApiModel
+            The attachment upload action to be inserted to the front of queue
+        """
+        action_type = action["actionType"]
+        action_id = action["sessionActionId"]
+        cancel_event = Event()
+
+        action = cast(AttachmentUploadActionApiModel, action)
+        queue_entry = AttachmentUploadActionQueueEntry(
+            cancel=cancel_event,
+            definition=action,
+        )
+
+        self._actions.insert(0, queue_entry)
+        self._actions_by_id[action_id] = queue_entry
+        logger.debug("Successfully inserted front of queue: %s action: %s", action_type, action_id)
+
     def replace(
         self,
         *,
         actions: Iterable[
             EnvironmentActionApiModel
             | TaskRunActionApiModel
-            | SyncInputJobAttachmentsActionApiModel
+            | AttachmentDownloadActionApiModel
+            | AttachmentUploadActionApiModel
         ],
     ) -> None:
         """Update the queue's actions"""
         queue_entries: list[
             TaskRunQueueEntry
             | EnvironmentQueueEntry
-            | SyncInputJobAttachmentsQueueEntry
-            | SyncInputJobAttachmentsStepDependenciesQueueEntry
+            | AttachmentDownloadActionQueueEntry
+            | AttachmentDownloadActionStepDependenciesQueueEntry
+            | AttachmentUploadActionQueueEntry
         ] = []
 
         action_ids_added = list[str]()
@@ -305,14 +362,14 @@ class SessionActionQueue:
                         definition=action,
                     )
                 elif action_type == "SYNC_INPUT_JOB_ATTACHMENTS":
-                    action = cast(SyncInputJobAttachmentsActionApiModel, action)
+                    action = cast(AttachmentDownloadActionApiModel, action)
                     if "stepId" not in action:
-                        queue_entry = SyncInputJobAttachmentsQueueEntry(
+                        queue_entry = AttachmentDownloadActionQueueEntry(
                             cancel=cancel_event,
                             definition=action,
                         )
                     else:
-                        queue_entry = SyncInputJobAttachmentsStepDependenciesQueueEntry(
+                        queue_entry = AttachmentDownloadActionStepDependenciesQueueEntry(
                             cancel=cancel_event,
                             definition=action,
                         )
@@ -368,6 +425,16 @@ class SessionActionQueue:
             action_type = action_queue_entry.definition["actionType"]
             action_definition = action_queue_entry.definition
             action_id = action_definition["sessionActionId"]
+            # Remove the action from the queue up-front. We are committed to
+            # consuming the front action regardless of the outcome below: on
+            # success it is returned to be run; if resolving its job-entity
+            # details raises a terminal SessionActionError, the Session reports
+            # it as FAILED. Leaving it queued would let cancel_all() re-report
+            # it as NEVER_ATTEMPTED and clobber that FAILED status -- and the
+            # service rejects NEVER_ATTEMPTED for the first session action,
+            # which crashes the worker's scheduler.
+            del self._actions[0]
+            del self._actions_by_id[action_id]
             if action_type.startswith("ENV_"):
                 action_queue_entry = cast(EnvironmentQueueEntry, action_queue_entry)
                 action_definition = action_queue_entry.definition
@@ -395,15 +462,49 @@ class SessionActionQueue:
                             action_id, SessionActionLogKind.ENV_EXIT, str(e)
                         ) from e
                 if action_type == "ENV_ENTER":
+                    # Step-scoped environments need the step's name so their
+                    # scripts can resolve Step.Name. The step id is carried in
+                    # the environment id itself, so this does not depend on
+                    # where the action sits in the queue. Step-scope `let`
+                    # values arrive separately, in the environment's own
+                    # resolved symbol table. The raw declaration strings are
+                    # additionally threaded as step_let_declarations so the
+                    # decode-time `let` name checks pass.
+                    step_name: str | None = None
+                    step_let_declarations: list[str] | None = None
+                    if (env_step_id := _step_id_from_environment_id(environment_id)) is not None:
+                        try:
+                            env_step_details = self._job_entities.step_details(step_id=env_step_id)
+                        except (ValueError, RuntimeError, UnsupportedSchema):
+                            # The task run for this step will surface the real
+                            # entity error; entering without step context here
+                            # matches the pre-existing behavior.
+                            pass
+                        else:
+                            step_name = env_step_details.step_template.name
+                            # The declaring step's template-scope `let`
+                            # declarations (distinct from the step script's own
+                            # `let`). A step-scoped environment can reference
+                            # these names in its variables/script; the Rust
+                            # runtime lifts the environment into a standalone
+                            # document and re-decodes it, so those references
+                            # need the declarations present or decode rejects
+                            # them. Threaded through for the Rust adapter to
+                            # restore. Entries are already wire-form strings.
+                            step_let_declarations = env_step_details.step_template.let
+
                     next_action = EnterEnvironmentAction(
                         id=action_id,
                         job_env_id=environment_id,
                         details=environment_details,
+                        step_name=step_name,
+                        step_let_declarations=step_let_declarations,
                     )
                 elif action_type == "ENV_EXIT":
                     next_action = ExitEnvironmentAction(
                         id=action_id,
                         environment_id=environment_id,
+                        details=environment_details,
                     )
                 else:
                     raise ValueError(f'Unknown action type "{action_type}".')
@@ -411,7 +512,7 @@ class SessionActionQueue:
                 action_queue_entry = cast(TaskRunQueueEntry, action_queue_entry)
                 action_definition = action_queue_entry.definition
                 step_id = action_definition["stepId"]
-                task_id = action_definition["taskId"]
+                task_id = action_definition.get("taskId")
                 try:
                     step_details = self._job_entities.step_details(step_id=step_id)
                 except UnsupportedSchema as e:
@@ -437,31 +538,47 @@ class SessionActionQueue:
                     id=action_id,
                     details=step_details,
                     task_parameter_values=task_parameters,
-                    task_id=action_definition["taskId"],
+                    task_id=action_definition.get("taskId"),
                 )
+            elif action_type == "SYNC_OUTPUT_JOB_ATTACHMENTS":
+                action_queue_entry = cast(AttachmentUploadActionQueueEntry, action_queue_entry)
+                action_definition = action_queue_entry.definition
+                step_id = action_definition["stepId"]
+                task_id = action_definition.get("taskId")
+                start_time = action_definition["startTime"]
+                next_action = AttachmentUploadAction(
+                    id=action_id,
+                    session_id=self._session_id,
+                    step_id=step_id,
+                    task_id=task_id,
+                    start_time=start_time,
+                )
+
             elif action_type == "SYNC_INPUT_JOB_ATTACHMENTS":
                 action_definition = action_queue_entry.definition
-                action_definition = cast(SyncInputJobAttachmentsActionApiModel, action_definition)
+                action_definition = cast(AttachmentDownloadActionApiModel, action_definition)
                 if "stepId" not in action_definition:
-                    action_queue_entry = cast(SyncInputJobAttachmentsQueueEntry, action_queue_entry)
+                    action_queue_entry = cast(
+                        AttachmentDownloadActionQueueEntry, action_queue_entry
+                    )
                     try:
                         job_attachment_details = self._job_entities.job_attachment_details()
                     except UnsupportedSchema as e:
                         raise JobEntityUnsupportedSchemaError(
-                            action_id, SessionActionLogKind.JA_SYNC, e._version
+                            action_id, SessionActionLogKind.JA_SYNC_INPUT, e._version
                         ) from e
                     except ValueError as e:
                         raise JobAttachmentDetailsError(
-                            action_id, SessionActionLogKind.JA_SYNC, str(e)
+                            action_id, SessionActionLogKind.JA_SYNC_INPUT, str(e)
                         ) from e
-                    next_action = SyncInputJobAttachmentsAction(
+                    next_action = AttachmentDownloadAction(
                         id=action_id,
                         session_id=self._session_id,
                         job_attachment_details=job_attachment_details,
                     )
                 else:
                     action_queue_entry = cast(
-                        SyncInputJobAttachmentsStepDependenciesQueueEntry, action_queue_entry
+                        AttachmentDownloadActionStepDependenciesQueueEntry, action_queue_entry
                     )
 
                     try:
@@ -482,15 +599,70 @@ class SessionActionQueue:
                             str(e),
                             step_id=action_definition["stepId"],
                         ) from e
-                    next_action = SyncInputJobAttachmentsAction(
+                    next_action = AttachmentDownloadAction(
                         id=action_id,
                         session_id=self._session_id,
                         step_details=step_details,
                     )
+
             else:
                 raise ValueError(
                     f'Unknown action type "{action_type}". Complete action = {action_definition}'
                 )
-            del self._actions[0]
-            del self._actions_by_id[action_id]
         return next_action
+
+    def peek_resolved_symbol_table_json(self) -> str | None:
+        """Scan queued actions for the first resolved symbol table without consuming.
+
+        The scan skips action types that carry no symbol table (e.g. attachment
+        sync actions) and returns the table from the first ``ENV_*`` or
+        ``TASK_RUN`` entry found.  This is necessary because the service may
+        place ``SYNC_INPUT_JOB_ATTACHMENTS`` before environment-enter actions
+        for any job with attachments — without the scan, session-scoped symbols
+        such as ``Job.Name`` would be unavailable.
+
+        This accessor is non-consuming: the queue state is not mutated, and a
+        subsequent ``dequeue`` call will still yield the same front action.
+
+        Entity resolution results are cached by ``JobEntities``, so the later
+        ``dequeue`` issues no additional service request for the same entity.
+
+        Returns
+        -------
+        str | None
+            The ``resolved_symbol_table_json`` from the first action whose type
+            carries a table, or None when the queue is empty or contains only
+            action types without a table.
+        """
+        # The service emits the same session-scoped symbols (e.g. Job.Name)
+        # into every step and environment entity's table, so it is safe to
+        # return the first match regardless of position in the queue.
+        for action_queue_entry in self._actions:
+            action_type = action_queue_entry.definition["actionType"]
+            try:
+                if action_type.startswith("ENV_"):
+                    action_queue_entry = cast(EnvironmentQueueEntry, action_queue_entry)
+                    environment_id = action_queue_entry.definition["environmentId"]
+                    environment_details = self._job_entities.environment_details(
+                        environment_id=environment_id
+                    )
+                    return environment_details.resolved_symbol_table_json
+                elif action_type == "TASK_RUN":
+                    action_queue_entry = cast(TaskRunQueueEntry, action_queue_entry)
+                    step_id = action_queue_entry.definition["stepId"]
+                    step_details = self._job_entities.step_details(step_id=step_id)
+                    return step_details.resolved_symbol_table_json
+                else:
+                    continue
+            except Exception:
+                # This accessor only seeds session-scoped symbols (e.g.
+                # Job.Name), so a failure must not break session creation.
+                # Skip to the next candidate — the subsequent dequeue surfaces
+                # the real error through the normal action-failure path.
+                logger.warning(
+                    "Failed to prefetch resolved symbol table for a queued action "
+                    "(type=%s); scanning next action.",
+                    action_type,
+                )
+                continue
+        return None

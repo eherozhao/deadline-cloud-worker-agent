@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import os
 import secrets
@@ -23,6 +24,10 @@ from openjd.model import (
     SpecificationRevision,
     TemplateSpecificationVersion,
 )
+from openjd.model.v2023_09 import (
+    CommandString,
+    ArgString,
+)
 from openjd.sessions import (
     PathMappingRule,
     SessionUser,
@@ -43,7 +48,7 @@ from deadline_worker_agent.sessions.job_entities.job_attachment_details import (
     JobAttachmentDetails,
     JobAttachmentManifestProperties,
 )
-from deadline_worker_agent.startup.config import JobsRunAsUserOverride
+from deadline_worker_agent.config import JobsRunAsUserOverride
 
 VFS_DEFAULT_INSTALL_PATH = "/opt/deadline_vfs"
 
@@ -115,6 +120,14 @@ def windows_job_user() -> str:
 
 
 @pytest.fixture
+def session_root_dir() -> Path:
+    if os.name == "nt":
+        return Path("C:\\Sessions\\Root")
+    else:
+        return Path("/my/session/root")
+
+
+@pytest.fixture
 def parsed_args(
     farm_id: str,
     fleet_id: str,
@@ -131,6 +144,7 @@ def parsed_args(
     grant_required_access: bool,
     disallow_instance_profile: bool,
     windows_job_user: str,
+    session_root_dir: Path,
 ) -> ParsedCommandLineArguments:
     parsed_args = ParsedCommandLineArguments()
     parsed_args.farm_id = farm_id
@@ -148,6 +162,7 @@ def parsed_args(
     parsed_args.grant_required_access = grant_required_access
     parsed_args.disallow_instance_profile = disallow_instance_profile
     parsed_args.windows_job_user = windows_job_user
+    parsed_args.session_root_dir = session_root_dir
     return parsed_args
 
 
@@ -194,12 +209,12 @@ def job_run_as_user_overrides(job_user: SessionUser) -> JobsRunAsUserOverride:
 
 @pytest.fixture
 def command():
-    return "echo"
+    return CommandString("echo")
 
 
 @pytest.fixture
 def on_run_args():
-    return ["on run"]
+    return [ArgString("on run")]
 
 
 @pytest.fixture
@@ -346,7 +361,7 @@ def job_attachment_manifest_properties(
     return JobAttachmentManifestProperties(
         root_path="/foo/bar",
         root_path_format="posix",
-        file_system_location_name="",
+        file_system_location_name="test-location",
         input_manifest_path=f"{queue_job_attachment_settings.root_prefix}/Manifests/{farm_id}/{queue_id}/Inputs/0000/0123_input.xxh128",
         input_manifest_hash="inputmanifesthash",
         output_relative_directories=[job_attachment_output_directory],
@@ -438,14 +453,14 @@ def host_properties(hostname: str) -> HostProperties:
 
 @pytest.fixture
 def mock_config_file_not_found() -> Generator[MagicMock, None, None]:
-    """Fixture that mocks deadline_worker_agent.startup.config_file.ConfigFile.load() to raise a
+    """Fixture that mocks deadline_worker_agent.config.config_file.ConfigFile.load() to raise a
     FileNotFound error.
 
     This can be used to avoid tests being impacted by the contents of a worker agent config file
     present in the development environment.
     """
     with patch(
-        "deadline_worker_agent.startup.config_file.ConfigFile.load",
+        "deadline_worker_agent.config.config_file.ConfigFile.load",
         side_effect=FileNotFoundError(),
     ) as mock_config_file_load:
         yield mock_config_file_load

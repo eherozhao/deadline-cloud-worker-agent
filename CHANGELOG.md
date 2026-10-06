@@ -1,3 +1,411 @@
+## 0.33.5 (2026-09-30)
+
+### Features
+* Host configuration script output is now logged with the type `Worker/HostConfiguration`, making it easier to filter and identify host configuration script stdout/stderr in logs. Previously, this output was emitted as untyped log events that were difficult to distinguish from other log messages. (#1096)
+## 0.33.4 (2026-09-21)
+
+### Features
+* The worker agent now accepts string-encoded boolean job parameters (e.g., "true", "false", "yes", "no", "on", "off", "1", "0") in addition to native JSON booleans. This ensures compatibility with both older jobs that use native booleans and newer jobs that use the OpenJD case-insensitive boolean string vocabulary. (#1098)
+## 0.33.3 (2026-09-16)
+
+### Bug Fixes
+* Fixed an issue where entering a step-scoped environment whose template references the declaring step's `let` bindings would fail on the Rust session runtime. The environment template now correctly carries step `let` declarations, preventing undefined variable errors during decoding. (#1092)
+## 0.33.2 (2026-09-09)
+
+### Features
+* The default `session_runtime` setting is now `SERVICE_SELECTED` instead of `PYTHON`, allowing fleets to defer session-runtime selection to the service by default. Behavior is unchanged for fleets without service-side routing configured, as the service resolves to the Python runtime when no per-session runtime hint is provided. Operators can pin `session_runtime = "python"` to opt out. (#1084)
+
+### Bug Fixes
+* Fixed an issue where `Job.Name` was not correctly resolved for sessions that begin with an attachment sync action. (#1075)
+## 0.33.1 (2026-08-26)
+
+### Features
+* The resolved symbol table is now forwarded to v0 sessions, enabling downstream session actions to access resolved symbols. (#1077)
+
+### Bug Fixes
+* Fixed incorrect host CPU and disk utilization metrics. CPU and disk usage values are now reported correctly. Additionally, host metrics collection is now non-fatal — if the metrics thread cannot be started, the agent will log a warning instead of crashing. (#1036)
+## 0.33.0 (2026-08-21)
+
+### BREAKING CHANGES
+* The `total-disk-used-percent` metric now reports values on a 0-100 scale instead of a 0.0-1.0 fraction. Previously, a 25% full disk was incorrectly reported as 0.25; it now correctly reports as 25. (#1067)
+
+### Features
+* The worker agent now accepts and forwards the `resolvedSymbolTable` field from `BatchGetJobEntity` step and environment details to the session runtime, enabling pre-resolved EXPR symbols (Job.Name, Param.*, RawParam.*, step let values) to be used in sessions. (#1063)
+* Session extension enablement is now driven by the job's `extensions` declaration from `BatchGetJobEntity`. Jobs can explicitly declare which extensions to enable, with backward compatibility maintained when the field is absent. (#1062)
+* Added support for 8 new EXPR parameter types (`bool`, `rangeExpr`, `stringList`, `pathList`, `intList`, `floatList`, `boolList`, `intListList`) in API response parsing. Jobs using these parameter types will no longer crash the session. (#1064)
+
+### Bug Fixes
+* Fixed a crash when jobs use EXPR parameter types (e.g., `bool`, `rangeExpr`, list types) — entity validation previously rejected these types before they could be parsed. (#1065)
+* Fixed parameter type resolution for LIST[*] job parameter types (LIST_STRING, LIST_INT, etc.) which previously failed with a "type not defined" error due to incorrect enum member lookup. (#1066)
+* Step-scoped environments now correctly receive their step's name and let bindings. (#1061)
+* On Windows, materialized embedded files now have explicit ACLs granting the agent user full control and the job user read access, fixing issues where files could be unreadable or over-exposed when NTFS inheritance is misconfigured. (#1059)
+## 0.33.0 (2026-08-20)
+
+### BREAKING CHANGES
+* The `total-disk-used-percent` metric now reports on a 0-100 scale instead of the incorrect 0.0-1.0 fraction. Previously, a 25% full disk was reported as 0.25; it is now correctly reported as 25. If you have alerts or dashboards based on this metric, update your thresholds accordingly. (#1067)
+* Session working directory naming on Windows has changed (session ID prefix removed, `embedded_files` renamed to `ef`) for MAX_PATH compliance. This may affect workflows that depend on specific working directory paths. (#1068)
+
+### Features
+* Added support for EXPR parameter types (`bool`, `rangeExpr`, `stringList`, `pathList`, `intList`, `floatList`, `boolList`, `intListList`) in API response parsing. Jobs using these parameter types will no longer crash the session. (#1064)
+* The worker agent now accepts and forwards the `resolvedSymbolTable` from the service to the session runtime, enabling pre-resolved EXPR symbols (Job.Name, Param.*, RawParam.*, step let values) to be used in sessions. (#1063)
+* Session extension enablement is now driven by the job's declaration in `JobDetails`. Jobs can explicitly declare which extensions they need, and the worker agent will enable only those extensions (plus `REDACTED_ENV_VARS`). (#1062)
+
+### Bug Fixes
+* Fixed step-scoped environments not receiving their step's name and let bindings, which could cause incorrect environment configuration during sessions. (#1061)
+* Fixed a crash when jobs use LIST parameter types (e.g., `LIST[STRING]`, `LIST[INT]`) due to incorrect Rust parameter type enum member lookup by value instead of name. (#1066)
+* Fixed EXPR parameter types being rejected during job entity validation, which prevented jobs using these parameter types from running via the BatchGetJobEntity path. (#1065)
+* Fixed materialized embedded files on Windows not having correct permissions. An explicit Windows ACL is now set granting the agent user full control and the job user read access, preventing issues when NTFS inheritance is absent or misconfigured. (#1059)
+## 0.32.0 (2026-08-14)
+
+### BREAKING CHANGES
+* The worker agent no longer honors a region in the log configuration options for CloudWatch Logs routing. Workers already route session logs to the home region by default, so cross-region log routing via log config options has been removed. (#1050)
+
+### Features
+* The worker agent now correctly parses OpenJD templates that use the WRAP_ACTIONS extension (onWrapEnvEnter, onWrapTaskRun, onWrapEnvExit). Previously, environments and steps using wrap action hooks failed to parse. (#1049)
+
+### Bug Fixes
+* Fixed an issue where OpenJD environments referencing job parameters (e.g., `Param.Message`) failed to enter on the Rust session runtime with a `ModelValidationError`. (#1051)
+* Raised the openjd-model dependency floor to >= 0.11.3, which fixes: Env.File.* references now resolve inside wrap action hooks, `repr_sh(flatten([]))` no longer errors on empty lists, and IntRangeExpr expansion is no longer capped at 1024 elements. (#1054)
+## 0.31.1 (2026-08-12)
+
+### Features
+* The worker agent installer (`install-deadline-worker`) now experimentally supports macOS (darwin), allowing macOS hosts to be configured as workers in a customer-managed fleet. Note that the `--vfs-install-path` option is not supported on macOS. (#1012)
+## 0.31.0 (2026-08-11)
+
+### Features
+* Rust session runtime adapter: sessions can run on the OpenJD v1 Rust runtime as an alternative to the Python runtime. Select it by setting `session_runtime` in worker.toml to `python`, `rust`, or `service-selected`. (#1002)
+* With `service-selected`, the session runtime (Python or Rust) is chosen from a `runtimeHint` provided by the service, defaulting to Python when no hint is given. (#1009, #1016)
+* Runtime selection and failure telemetry events added. To opt out, set `opt_out = true` under `[telemetry]` in worker.toml, pass `--telemetry-opt-out` to the installer, or set the `DEADLINE_CLOUD_TELEMETRY_OPT_OUT=true` environment variable. (#1021)
+
+### Bug Fixes
+* Wrap-environment jobs failed on both the Python and Rust runtimes because `step_name` wasn't forwarded, leaving RFC 0008's `WrappedStep.Name` unresolved; both runtime paths now forward it. (#1039, #1040)
+* Rust runtime panics no longer silently kill the session thread; they are now reported as a failed session with proper cleanup and telemetry. (#1026)
+* Transient network errors (connection closed, connect/read timeout, endpoint connection) are now retried with exponential backoff instead of terminating the agent. (#1013)
+* Credentials expiring mid-call during hibernate/sleep no longer cause an unrecoverable exit; the agent now detects the time jump and retries with bootstrap credentials. (#1014)
+## 0.30.2 (2026-07-14)
+
+### Features
+* Cross-region CloudWatch Logs routing now uses the region specified in log configuration options, enabling proper log delivery for multi-region fleet configurations. (#997)
+
+### Bug Fixes
+* Fixed an issue where session action structure errors were not properly captured, which could lead to incomplete error reporting for failed session actions. (#1005)
+## 0.30.1 (2026-07-03)
+
+### Features
+* Introduced the `SessionRuntime` abstraction layer and `PythonSessionRuntime` adapter, providing a pluggable interface between the worker agent and the OpenJD session backend. (#972)
+* Added slow-path warning and timeout diagnostics for job attachment sync operations, improving visibility when attachment downloads are unexpectedly slow. (`dd0a43e`)
+
+## 0.30.0 (2026-06-02)
+
+### BREAKING CHANGES
+* The `--disallow-instance-profile` option now requires IMDS to be reachable. If you were using this option on non-EC2 machines, you must remove it. Previously the worker would continue running when IMDS was unreachable; now it will exit with an error. (#935)
+
+### Features
+* The worker agent now supports Windows domain users in both Down-Level Logon Name (DDL) and User Principal Name (UPN) formats. Session cleanup, installer group membership checks, and user rights lookups all correctly handle domain user formats. (#940)
+
+### Bug Fixes
+* Fixed `UnicodeEncodeError` on Windows when processing job attachments with non-ASCII characters (e.g., Cyrillic or Unicode quotes) in file paths. The attachment upload/download subprocesses now use UTF-8 encoding. (#934)
+## 0.29.2 (2026-05-12)
+## 0.29.1 (2026-05-07)
+
+### Features
+* Job attachment S3 bucket and root prefix are now exposed as `DEADLINE_JA_S3_BUCKET` and `DEADLINE_JA_ROOT_PREFIX` environment variables in the session environment when job attachment settings are configured. This allows plugins to access job attachment storage locations without additional API calls. (#917)
+* Added progress timer logging during host configuration script execution. The agent now periodically logs elapsed and remaining time (every 30s, accelerating to every 10s when ≤60s remain) and emits a warning when the server-side timeout is reached, improving observability for host configuration timeouts. (`d30e925`)
+* Added region configuration support to `worker.toml` and the installer, allowing you to explicitly configure the AWS region for the worker agent. (`0690a0f`)
+* Added `[telemetry]` section to `worker.toml` with `opt_out` and `identifier` settings, and `--telemetry-opt-out` / `--no-telemetry-opt-out` CLI flags to `python -m deadline_worker_agent.config`. (#920)
+* Removed dependency on the `deadline` package (client library/CLI/config) and use `deadline-job-attachments` directly. Telemetry settings previously stored in `~/.deadline/config` are read as a temporary fallback if not specified. This fallback will be removed in a future release. (#920)
+
+## 0.29.0 (2026-03-16)
+
+### BREAKING CHANGES
+* Job attachment downloads and uploads now run as the job user instead of the worker agent user. Previously available as the opt-in `ASSET_SYNC_JOB_USER_FEATURE` feature flag, this behavior is now the default and the legacy code path has been removed. Attachment sync operations are now run as OpenJD session actions under the job user's OS identity (`jobRunAsUser`).
+* The `ASSET_SYNC_JOB_USER_FEATURE` environment variable is no longer recognized. The feature flag module has been removed as this behavior is now always enabled.
+* The following APIs have been removed in favour of the new OpenJD-based attachment actions:
+  * `SyncInputJobAttachmentsAction` — replaced by `AttachmentDownloadAction`
+  * `SyncInputJobAttachmentsActionType` — replaced by `AttachmentDownloadActionType`
+  * `Session.sync_asset_inputs()` — attachment downloads are now handled by `AttachmentDownloadAction` running as an OpenJD session action
+  * `Session._sync_asset_outputs()` — attachment uploads are now handled by `AttachmentUploadAction` running as an OpenJD session action
+
+### Features
+* remove deprecated sync input and output code path replaced by attachment download and upload (#877) ([`ddb37e1`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/ddb37e1ee34e6f8afed0aec70637310a02e6a8b2))
+
+### Bug Fixes
+* **installer, windows**: SIDs with no LSA rights could fail the install on non-english locales (#891) ([`3182322`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/318232239cb60cb29e012b312a75786971001115))
+
+
+## 0.28.21 (2026-01-14)
+
+
+### Features
+* This is the first Worker Agent release which fully supports [OpenJD chunking](https://github.com/OpenJobDescription/openjd-specifications/blob/mainline/rfcs/0001-task-chunking.md).
+* Report output job attachment manifest locations to the service.(#865) ([`d748589`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/d7485896b739c2d5017638a15d294cea5c8fae23))
+
+
+### Bug Fixes
+* Worker fails to detect and upload output files when job outputs have file permissions scoped to exclude the worker-agent user. (#865) ([`d748589`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/d7485896b739c2d5017638a15d294cea5c8fae23))
+
+
+
+## 0.28.20 (2025-12-29)
+
+
+### Features
+* Added telemetry for filesystem type detection (#843) ([`ddee082`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/ddee0827a127c1b74599d934f653a2631558ebf8))
+
+### Bug Fixes
+* Fixed false positive "low transfer rate" failures when syncing job attachments with many small files (#805)
+ ([`3af802b`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/3af802b0a2204864ee3093834e1916ff87100656))
+
+
+## 0.28.19 (2025-12-09)
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+
+* ASSET_SYNC_JOB_USER_FEATURE - Improve logging for attachment upload and download (#826) ([`557d6f5`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/557d6f5a07702ccef346e0807ef97adbfffd05a3))
+
+* ASSET_SYNC_JOB_USER_FEATURE - Escape special characters in output directory patterns when generate diff for upload (#828) ([`7022f96`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/7022f962d05d6f079180d419d93794a18e8ba3cf))
+
+
+## 0.28.18 (2025-11-13)
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+
+* ASSET_SYNC_JOB_USER_FEATURE - job attachment upload failures when session environment changes python search path (#810) ([`8a7806d`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/8a7806dd20cd49b2be202ae4052eeee4fd39f506))
+
+
+## 0.28.17 (2025-10-31)
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+
+* ASSET_SYNC_JOB_USER_FEATURE - Job attachments sync output processing information was not being logged (#800) ([`a1f103d`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/a1f103dec6999aea2fe3a442cff5e2385ddc699b))
+
+
+## 0.28.16 (2025-10-28)
+
+
+### Features
+* add DEADLINE_STEP_ID to task run env vars (#787) ([`4ee307d`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/4ee307d1227dc8629cc32ff4cd3c23e516d92ff3))
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+
+* MANIFEST_REPORTING_FEATURE - manifests being reported without job attachments (#789) ([`49b175a`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/49b175a4b2b061b2f4c4eaf542aaa53306bdba51))
+
+
+## 0.28.15 (2025-10-23)
+
+### Features
+* support optional task id in task run session actions (#758) ([`dece265`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/dece26572600d47c26db937bcdecb4ae894e72ac))
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+
+* ASSET_SYNC_JOB_USER_FEATURE - job attachments does not fall back to COPIED when launching VFS fails (#753) ([`f0f2696`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/f0f269629cd5c8ca88b4fde8b0850a9d42525735))
+* ASSET_SYNC_JOB_USER_FEATURE - job attachment output manifest upload uses current time to construct s3 partition (#767) ([`84bb52d`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/84bb52d7c193a2e3fc72c712fb2fda25ae93e3f5))
+* ASSET_SYNC_JOB_USER_FEATURE - add progress reporting and low transfer rate check to sync input attachments (#759) ([`5504ff3`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/5504ff38fba53664295a14617e781c64dd76323f))
+* ASSET_SYNC_JOB_USER_FEATURE - enhance download process by using WorkerManifestProperties and download_files_from_manifests (#755) ([`0272a46`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/0272a468157b893165d5f855d52b5c50e7d43e96))
+* ASSET_SYNC_JOB_USER_FEATURE - enhance upload process by using WorkerManifestProperties and upload_assets (#762) ([`73ea2d7`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/73ea2d7e270567e4a1f8ee104d9a1ad4442797d2))
+* ASSET_SYNC_JOB_USER_FEATURE - attachment uploads all as output when no output relative directories defined for a root (#780) ([`3b3d8ec`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/3b3d8ec462ab8ac0fb44a35b24416432d36d5804))
+* MANIFEST_REPORTING_FEATURE - not reporting manifests in progress updates (#779) ([`c0ffe77`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/c0ffe77ac884235c79bf68561f4f7880abf331a1))
+
+
+## 0.28.14 (2025-09-15)
+
+
+### Features
+* macOS worker can stop session processes and shutdown host (#720) ([`4524bf4`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/4524bf4e503f4d8c0610b954f81534d289244c2b))
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+* MANIFEST_REPORTING_FEATURE - Add worker session data model for job attachment sync operations (#727) ([`1f3e29c`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/1f3e29c04ddf6f4251253fb0ab88fafae58efe88))
+
+## 0.28.13 (2025-07-23)
+
+
+### Features
+* Enable `TASK_CHUNKING` and `REDACTED_ENV_VARS` OpenJobDescription extensions by default. (#691) ([`5564caa`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/5564caa73b25492c98154ea62dcb33ec121a1ef7))
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+* MANIFEST_REPORTING_FEATURE - add output manifest reporting (#663) ([`6ac9789`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/6ac97892055ef6bdf7688f002abdffd68d0d85d1))
+* ASSET_SYNC_JOB_USER_FEATURE - avoid embedded file name conflicts with download/upload script (#690) ([`2b54166`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/2b54166695ed3afc8f09de8c6b736a5ed28e1023))
+  If a file named either `upload.py` or `download.py` was uploaded by a user, this would break the job attachments feature.
+
+
+
+
+## 0.28.12 (2025-06-24)
+
+
+### Dependencies
+* Update openjd-sessions requirement from ==0.10.2 to ==0.10.3 (#668) ([`a19e03e`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/a19e03ebd522c6c0ad815522bd3c39b8ae553f97))
+
+
+## 0.28.11 (2025-06-13)
+
+
+
+### experimental
+These changes are experimental and only available through the use of feature flags
+* ASSET_SYNC_JOB_USER_FEATURE - VFS not launching for Job Attachment VIRTUAL (#669) ([`59e3d4a`](https://github.com/aws-deadline/deadline-cloud-worker-agent/
+
+## 0.28.10 (2025-06-09)
+
+
+
+### Features
+* Add GPU Utilization Metrics in Worker Host Metric Logging (#657) ([`99b30b8`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/99b30b8c3ad67ab5ecd401089079833fec4a78f1))
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+* ASSET_SYNC_JOB_USER_FEATURE - Error sync inputs due to no path mapping rule found for the source path (#661) ([`f7ee2a0`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/f7ee2a0f3202b097bc383224c5ea22392ff0d8fc))
+
+## 0.28.9 (2025-06-05)
+
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+* ASSET_SYNC_JOB_USER_FEATURE - Job output download takes old session action output when there is a rerun (#641) ([`d42efc5`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/d42efc52f30ef56a6b24e6d6c529deb74c7adc3b))
+
+## 0.28.8 (2025-06-04)
+
+
+
+### Bug Fixes
+* Disk Read/Write Bytes per Second Metrics Would Always Increase (#653) ([`e56a58a`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/e56a58a7b04a772bf844904486714f3dad5619d4))
+
+### Experimental
+These changes are experimental and only available through the use of feature flags
+* ASSET_SYNC_JOB_USER_FEATURE - Job Attachments would repeatedly upload output from previous tasks in the same session (#631) ([`a0c504a`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/a0c504a8e011a661a4f348ed83a6a4373d1669c0))
+
+## 0.28.7 (2025-05-21)
+
+
+### Features
+* Host Configuration feature launch (#636) ([`dd2071d`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/dd2071d1d01d6cd811531bc1d689c114a7e760e5))
+* Add initial support for chunkInt parameter type (#606) ([`4c517b4`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/4c517b4a37c35ee4cc8c1ba79bfc6bc1cb29f250))
+
+### Bug Fixes
+* Worker agent exits on startup if host config log pre-exists with non-UTF8 contents (#634) ([`6466c4f`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/6466c4fbd509867f877a17af1a4a95693590808b))
+* Worker Agent crashes on corrupted cached credentials (#614) ([`7f1ec05`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/7f1ec05d86035febd68daffa603d8da404b8854a))
+
+### Experimental
+
+These changes are experimental and only available through the use of feature flags
+
+* ASSET_SYNC_JOB_USER_FEATURE - outputs would fail to upload with `NonValidInputError` when merging multiple manifests (#612) ([`4c12664`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/4c126648a657df83e065c77274c965b8d0ad283e))
+* ASSET_SYNC_JOB_USER_FEATURE - input files that were modified during a task run were mistakenly uploaded as output (#612) ([`4c12664`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/4c126648a657df83e065c77274c965b8d0ad283e))
+
+
+## 0.28.6 (2025-05-01)
+
+
+### Experimental
+
+These changes are experimental and only available through the use of feature flags
+
+* HOST_CONFIGURATION_FEATURE - Prevent Windows ACL inheritance for host config script and log and grant full control to Administrators ([`98dfbfc`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/98dfbfc9dbebdb02145c8413a76fe82f45635c58))
+* HOST_CONFIGURATION_FEATURE - delimit host configuration script with banners in worker logs and shutdown host on failure ([`f08bca8`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/f08bca8656488d9af992b1dca4b4969f5bdf96b6))
+
+
+## 0.28.5 (2025-04-11)
+
+
+### Experimental
+
+These changes are experimental and only available through the use of feature flags
+
+* HOST_CONFIGURATION_FEATURE - run admin host configuration scripts once worker becomes STARTED (#601) ([`d925c65`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/d925c65a052579675443d004295c2b70f019fe9b))
+
+
+## 0.28.4 (2025-04-03)
+
+
+
+
+## 0.28.3 (2025-03-13)
+
+
+
+### Bug Fixes
+* unexpected GPU memory configurations crash worker agent (#574) ([`b423bfb`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/b423bfb68e258c2b86e90925669572691ccab2c3))
+
+## 0.28.2 (2025-03-11)
+
+
+
+### Bug Fixes
+* worker agent unable to start without EC2 metadata access (#572) ([`5e73148`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/5e7314839a3cd9da7bfa50ab9f4198fcabb5edf4))
+
+## 0.28.1 (2025-03-05)
+
+
+
+### Bug Fixes
+* install-deadline-worker on Windows creates session root directory without read and traversal permissions for Users (#563) ([`29e7aee`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/29e7aee77ab362094b219dd5ec20920a1b859078))
+
+### Experimental
+
+These changes are experimental and only available through the use of feature flags
+
+* ASSET_SYNC_JOB_USER_FEATURE - **fix**: task with step-step dependency upload job inputs as outputs (#529) ([`abe0fb0`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/abe0fb0f2c4b04de1490943502f83061e160d938))
+
+
+## 0.28.0 (2025-02-27)
+**This Release has been pulled from PyPI. The use of this release contains a regression in default permissions for the session directory on Windows. Downgrade to 0.27.5 or upgrade to the next release if available.**
+
+### BREAKING CHANGES
+* A defect was fixed in the OpenJobDescription specification ([OpenJobDescription/openjd-specifications#70](https://github.com/OpenJobDescription/openjd-specifications/issues/70)) which causes a breaking change to Worker Agent behaviour. Environment exits previously had no default timeout and they now have a default timeout of 5 minutes. To have long-running environment exit actions, job templates can specify a large timeout value when defining environment exit actions in a job or environment template.
+
+### Features
+* configurable session root directory (#513) ([`dd541a1`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/dd541a12eac344e109ca283166f978a20af8439c))
+
+### Bug Fixes
+* more robust config file modifications in install-deadline-worker (#512) ([`1060b4b`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/1060b4bd29890c0b76ece8665b0415cb5a3303e2))
+* worker state file saved on AMI causes multiple instances sharing same worker ID (#527) ([`ec001c9`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/ec001c9830b0fd7639248a2b2bc892787993c5b2))
+* skip attachment upload when outputs not modified (#524) ([`972df4e`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/972df4ead8311967ad26844f0445859cae9ae483))
+* update log kind to differentiate sync input and sync output (#523) ([`af28588`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/af285880ae66c697534aabae2f28fbc626873fa8))
+
+## 0.27.5 (2024-12-14)
+
+
+### Features
+* directly send cancel OS signals on Linux (#479) ([`a0fc35c`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/a0fc35c419bba964ffa5146f8bb65c54064fc929))
+
+### Bug Fixes
+* increase e2e test instance size (#468) ([`2f7cc57`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/2f7cc57169d710f3da21412ae0f40f5b1e171f05))
+
+### Experimental
+
+These changes are experimental and only available through the use of feature flags
+
+* ASSET_SYNC_JOB_USER_FEATURE - run job attachment output upload as job user (#495) ([`678f29a`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/678f29a6ae86265b6a0f912cdcc52a2ceccb7b62))
+* ASSET_SYNC_JOB_USER_FEATURE - integrate with job attachment download cli as a openjd action run (#476) ([`07abc76`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/07abc76dc9bdd46a7281a6349b1bb7eaaa808810))
+
+## 0.27.4 (2024-10-30)
+
+
+### Features
+* include specific session runtime logs in the worker log (#422) ([`be55928`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/be55928bb55ca361a2900b16f599ccc1f1b03b7c))
+
+### Bug Fixes
+* non-user-friendly error when trying to install the worker agent as domain user (#457) ([`15afe89`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/15afe89930f99f92346a4b96806c4c68d76bdbae))
+
+## 0.27.3 (2024-10-17)
+
+
+
+### Bug Fixes
+* crash on startup when host has multiple NVIDIA GPUs (#435) ([`760118c`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/760118c0ab8157ecc5087fc919f6773b0cd6c376))
+* vague error message when no AWS region specified (#413) ([`0d5ccad`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/0d5ccadebab5aca5b562abf6d8032aa79ca51678))
+* WindowsPath is not JSON serializable during session cleanup (#412) ([`5d5055c`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/5d5055cf728a98769415a30a923eea057b8d9683))
+* Ensure scheduler drain and status update on Windows service shutdown (#408) ([`f269b67`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/f269b67d415e0203a49b9f85bf8b811b345f96e6))
+* Agent logs to `/var/log/messages` when running as a service on Linux (#396) ([`b2368ed`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/b2368edeaec80b6c31132195dbdf4579b5e7e225))
+* `--run-jobs-as-agent-user` crashes on windows (#395) ([`6fef296`](https://github.com/aws-deadline/deadline-cloud-worker-agent/commit/6fef2969ef5cd4eb12adc76eded4587f447c0726))
+
 ## 0.27.2 (2024-08-13)
 
 

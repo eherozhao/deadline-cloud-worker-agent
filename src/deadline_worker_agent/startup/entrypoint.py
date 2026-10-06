@@ -15,29 +15,33 @@ from threading import Event
 from typing import Optional
 from pathlib import Path
 
-from openjd.sessions import LOG as OPENJD_SESSION_LOG
+from ..aws_credentials.worker_boto3_session import WorkerBoto3Session
 
 from ..api_models import WorkerStatus
-from ..boto import DEADLINE_BOTOCORE_CONFIG, OTHER_BOTOCORE_CONFIG, DeadlineClient
-from ..errors import ServiceShutdown
-from ..log_sync.cloudwatch import stream_cloudwatch_logs
-from ..log_sync.loggers import ROOT_LOGGER, logger as log_sync_logger
-from ..worker import Worker
-from .bootstrap import bootstrap_worker
-from .capabilities import detect_system_capabilities
-from .config import Configuration, ConfigurationError
-from ..log_messages import (
-    AgentInfoLogEvent,
-    LogRecordStringTranslationFilter,
-    WorkerLogEvent,
-    WorkerLogEventOp,
-)
 from ..aws.deadline import (
     update_worker,
     update_worker_schedule,
     record_worker_start_telemetry_event,
     record_uncaught_exception_telemetry_event,
 )
+from ..boto import DEADLINE_BOTOCORE_CONFIG, OTHER_BOTOCORE_CONFIG, DeadlineClient
+from ..capabilities import detect_system_capabilities
+from ..config import Configuration, ConfigurationError
+from ..errors import ServiceShutdown
+from ..linux.capabilities import drop_kill_cap_from_inheritable
+from ..log_messages import (
+    AgentInfoLogEvent,
+    LogRecordStringTranslationFilter,
+    WorkerHostConfigurationStatus,
+    WorkerLogEvent,
+    WorkerLogEventOp,
+    WorkerHostConfigurationLogEvent,
+)
+from ..log_sync.cloudwatch import stream_cloudwatch_logs
+from ..log_sync.loggers import ROOT_LOGGER, logger as log_sync_logger
+from ..worker import Worker
+from .bootstrap import WorkerBootstrap, bootstrap_worker
+from .host_configuration_script import HostConfigurationScriptRunner
 
 __all__ = ["entrypoint"]
 _logger = logging.getLogger(__name__)
@@ -82,12 +86,22 @@ def entrypoint(cli_args: Optional[list[str]] = None, *, stop: Optional[Event] = 
         # Log the configuration (logs to DEBUG by default)
         config.log()
 
+        # If we have the CAP_KILL Linux capability, we must programmatically
+        # remove it from the inheritable capability set so it is not inherited
+        # by session action subprocesses
+        drop_kill_cap_from_inheritable()
+
         # Register the Worker
         try:
             worker_bootstrap = bootstrap_worker(config=config)
         except NoRegionError:
             _logger.warn(
-                "The Worker Agent was started with no AWS region specified. Refer to the Deadline Cloud Worker Agent documentation for guidance: https://github.com/aws-deadline/deadline-cloud-worker-agent/blob/release/README.md#running-outside-of-an-operating-system-service"
+                "The Worker Agent was started with no AWS region specified. "
+                "You can set the region using standard AWS environment variables "
+                "(AWS_DEFAULT_REGION, AWS_REGION), or in the worker configuration file "
+                "(worker.toml) under [aws] as 'region'. Refer to the Deadline Cloud Worker "
+                "Agent documentation for guidance: "
+                "https://github.com/aws-deadline/deadline-cloud-worker-agent/blob/release/README.md#running-outside-of-an-operating-system-service"
             )
             raise
         if worker_bootstrap.log_config is None:
@@ -159,6 +173,15 @@ def entrypoint(cli_args: Optional[list[str]] = None, *, stop: Optional[Event] = 
             # logs that we forward to CloudWatch.
             _log_agent_info()
 
+            # Run Worker Host Configuration.
+            _host_configuration(
+                config=config,
+                deadline_client=deadline_client,
+                worker_bootstrap=worker_bootstrap,
+                worker_id=worker_id,
+                session=session,
+            )
+
             worker_sessions = Worker(
                 farm_id=config.farm_id,
                 fleet_id=config.fleet_id,
@@ -174,7 +197,9 @@ def entrypoint(cli_args: Optional[list[str]] = None, *, stop: Optional[Event] = 
                 host_metrics_logging=config.host_metrics_logging,
                 host_metrics_logging_interval_seconds=config.host_metrics_logging_interval_seconds,
                 retain_session_dir=config.retain_session_dir,
+                session_runtime_kind=config.session_runtime,
                 stop=stop,
+                session_root_dir=config.session_root_dir,
             )
             try:
                 worker_sessions.run()
@@ -187,7 +212,9 @@ def entrypoint(cli_args: Optional[list[str]] = None, *, stop: Optional[Event] = 
             _agent_shutdown(deadline_client, config, worker_id, shutdown_requested_by_service)
 
     except ConfigurationError as e:
-        sys.stderr.write(f"ERROR: {e}{os.linesep}")
+        if sys.stderr:
+            sys.stderr.write(f"ERROR: {e}{os.linesep}")
+        _logger.error(f"Configuration error: {e}")
         sys.exit(1)
     except Exception as e:
         if isinstance(e, SystemExit):
@@ -312,6 +339,8 @@ def _host_shutdown(config: Configuration) -> None:
 
     if sys.platform == "win32":
         shutdown_command = ["shutdown", "-s"]
+    elif sys.platform == "darwin":
+        shutdown_command = ["sudo", "shutdown", "-h", "now"]
     else:
         shutdown_command = ["sudo", "shutdown", "now"]
 
@@ -349,16 +378,8 @@ def _configure_base_logging(
     ):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
-    # We don't want the Session logs to appear in the Worker Agent logs, so
-    # set the Open Job Description library's logger to not propagate.
-    # We do this because the Session log will contain job-specific customer
-    # sensitive data. The Worker's log is intended for IT admins that may
-    # have different/lesser permissions/access-rights/need-to-know than the
-    # folk submitting jobs, so keep the sensitive stuff out of the agent log.
-    OPENJD_SESSION_LOG.propagate = False
-
-    # Similarly, Job Attachments is a feature that only runs in the context of a
-    # Session. So, it's logs should not propagate to the root logger. Instead,
+    # Job Attachments is a feature that only runs in the context of a
+    # Session. So, its logs should not propagate to the root logger. Instead,
     # the Job Attachments logs will route to the Session Logs only.
     JOB_ATTACHMENTS_LOGGER = logging.getLogger("deadline.job_attachments")
     JOB_ATTACHMENTS_LOGGER.propagate = False
@@ -417,6 +438,119 @@ def _configure_base_logging(
     rotating_file_handler.addFilter(translation_filter)
 
     return bootstrapping_handler
+
+
+def _host_configuration(
+    config: Configuration,
+    deadline_client: DeadlineClient,
+    session: WorkerBoto3Session,
+    worker_bootstrap: WorkerBootstrap,
+    worker_id: str,
+) -> None:
+    """
+    Runs all business logic related to Host Configuration.
+    This method must be run within a cloudwatch stream context to stream logs.
+    If the host configuration run fails, the worker agent exits.
+    """
+
+    # If there was a host config, and it was bootstrapped before, only log a message.
+    if worker_bootstrap.host_config and worker_bootstrap.worker_info.host_configuration_succeeded:
+        _logger.info(
+            WorkerHostConfigurationLogEvent(
+                farm_id=config.farm_id,
+                fleet_id=config.fleet_id,
+                worker_id=worker_id,
+                message="Host Configuration has been setup before. Not running config scripts.",
+                status=WorkerHostConfigurationStatus.SKIPPED,
+            )
+        )
+        return
+    # Before the run loop starts, run the Host Configuration script.
+    elif worker_bootstrap.host_config:
+        _logger.info(
+            WorkerHostConfigurationLogEvent(
+                farm_id=config.farm_id,
+                fleet_id=config.fleet_id,
+                worker_id=worker_id,
+                message="Running host configuration script.",
+                status=WorkerHostConfigurationStatus.RUNNING,
+            )
+        )
+        host_config_runner = HostConfigurationScriptRunner(
+            logger=_logger,
+            configuration=config,
+            worker_id=worker_id,
+            session_directory=config.worker_persistence_dir,
+            worker_boto3_session=session,
+            host_configuration_script=worker_bootstrap.host_config.script_body,
+            host_configuration_timeout_seconds=worker_bootstrap.host_config.script_timeout_seconds,
+        )
+        exit_code = host_config_runner.run()
+        if exit_code == 0:
+            _logger.info(
+                WorkerHostConfigurationLogEvent(
+                    farm_id=config.farm_id,
+                    fleet_id=config.fleet_id,
+                    worker_id=worker_id,
+                    message="Worker Agent host configuration succeeded. Starting worker session loop.",
+                    status=WorkerHostConfigurationStatus.SUCCEEDED,
+                    exit_code=exit_code,
+                )
+            )
+            # Persist host configuration has been performed.
+            worker_bootstrap.worker_info.host_configuration_succeeded = True
+            worker_bootstrap.worker_info.save(config=config)
+            return
+        else:
+            _logger.critical(
+                WorkerHostConfigurationLogEvent(
+                    farm_id=config.farm_id,
+                    fleet_id=config.fleet_id,
+                    worker_id=worker_id,
+                    message=f"Worker Agent host configuration failed with exit code {exit_code}. Cannot run jobs, exiting.",
+                    status=WorkerHostConfigurationStatus.FAILED,
+                    exit_code=exit_code,
+                )
+            )
+            # Set this worker to stopped.
+            try:
+                update_worker(
+                    deadline_client=deadline_client,
+                    farm_id=config.farm_id,
+                    fleet_id=config.fleet_id,
+                    worker_id=worker_id,
+                    status=WorkerStatus.STOPPED,
+                )
+            except Exception as e:
+                _logger.error(
+                    WorkerLogEvent(
+                        op=WorkerLogEventOp.STATUS,
+                        farm_id=config.farm_id,
+                        fleet_id=config.fleet_id,
+                        worker_id=worker_id,
+                        message="Failed to set status to STOPPED: %s" % str(e),
+                    )
+                )
+
+            # Attempt to shutdown if possible.
+            if config.no_shutdown:
+                _logger.info("NOT shutting down the host. Local configuration settings say not to.")
+                sys.exit(1)
+
+            _logger.critical(
+                WorkerHostConfigurationLogEvent(
+                    farm_id=config.farm_id,
+                    fleet_id=config.fleet_id,
+                    worker_id=worker_id,
+                    message="Worker Agent host configuration failed. Attempting host shut down.",
+                    status=WorkerHostConfigurationStatus.FAILED,
+                    exit_code=exit_code,
+                )
+            )
+            while _repeatedly_attempt_host_shutdown():
+                _host_shutdown(config=config)
+                # Sleep for 30s and then try again; hopefully we never wake up
+                sleep(30)
 
 
 def _remove_logging_handler(handler: logging.Handler) -> None:

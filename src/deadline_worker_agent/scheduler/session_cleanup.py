@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-import os
+import sys
 import getpass
 from threading import Lock
 
@@ -82,8 +82,12 @@ class SessionUserCleanupManager:
 
     @staticmethod
     def _extract_username(user: str):
-        parts = user.split("\\")
-        return parts[-1].lower()
+        """Extracts the bare username from DDL (DOMAIN\\user), UPN (user@domain), or local format."""
+        if "\\" in user:
+            return user.split("\\")[-1].lower()
+        if "@" in user:
+            return user.split("@")[0].lower()
+        return user.lower()
 
     @staticmethod
     def _is_current_user(user: SessionUser):
@@ -95,9 +99,13 @@ class SessionUserCleanupManager:
     @staticmethod
     def _posix_cleanup_user_processes(user: SessionUser):
         assert isinstance(user, PosixSessionUser)
+        pkill_opt = ["-eU", user.user]
+        if sys.platform == "darwin":
+            pkill_opt = ["-lU", user.user]
+
         try:
             pkill_result = subprocess.run(
-                args=["sudo", "-u", user.user, "/usr/bin/pkill", "-eU", user.user],
+                args=["sudo", "-u", user.user, "/usr/bin/pkill", *pkill_opt],
                 capture_output=True,
                 check=True,
                 text=True,
@@ -112,10 +120,12 @@ class SessionUserCleanupManager:
                 logger.warning(f"Failed to stop processes running as '{user.user}': {e}")
                 raise
         else:
-            # pkill stdout will look like:
+            # AL2023 pkill -e stdout will look like:
             #  killed (pid 1111)
             #  killed (pid 2222)
-            #  etc.
+            # macOS pkill -l stdout will look like:
+            #  kill -15 1111
+            #  kill -15 2222
             pkill_output = "\n".join([pkill_result.stdout, pkill_result.stderr]).rstrip()
             logger.info(f"Stopped processes:\n{pkill_output}")
 
@@ -173,7 +183,7 @@ class SessionUserCleanupManager:
 
         logger.info(f"Cleaning up remaining session user processes for '{user.user}'")
 
-        if os.name == "posix":
-            SessionUserCleanupManager._posix_cleanup_user_processes(user)
-        else:
+        if sys.platform == "win32":
             SessionUserCleanupManager._windows_cleanup_user_processes(user)
+        else:
+            SessionUserCleanupManager._posix_cleanup_user_processes(user)

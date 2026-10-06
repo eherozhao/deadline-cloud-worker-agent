@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, fields, field
 from time import sleep
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple, cast
 import json
 import logging as _logging
 import stat
@@ -16,12 +16,13 @@ import requests
 from ..aws.deadline import (
     DeadlineRequestConditionallyRecoverableError,
     DeadlineRequestUnrecoverableError,
+    WorkerHostConfiguration,
     WorkerLogConfig,
     construct_worker_log_config,
     create_worker,
     update_worker,
 )
-from .config import Configuration
+from ..config import Configuration
 from .host_properties import get_host_properties as _get_host_properties
 from ..api_models import WorkerStatus
 from ..boto import DEADLINE_BOTOCORE_CONFIG, DeadlineClient, Session
@@ -52,6 +53,13 @@ _logger = _logging.getLogger(__name__)
 INSTANCE_PROFILE_REMOVAL_ATTEMPTS = 120
 INSTANCE_PROFILE_CHECK_DURATION_SECONDS = 1
 
+# The number of retry attempts and backoff parameters for IMDS connectivity errors during the
+# instance profile security check. These are separate from the profile removal polling loop.
+IMDS_RETRY_MAX_ATTEMPTS = 5
+IMDS_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
+IMDS_RETRY_BACKOFF_FACTOR = 2.0
+IMDS_RETRY_MAX_BACKOFF_SECONDS = 16.0
+
 
 class WorkerDeregisteredError(Exception):
     """Exception raised when Worker is deregistered"""
@@ -78,6 +86,24 @@ class InstanceProfileAttachedError(Exception):
         )
 
 
+class IMDSUnreachableError(Exception):
+    """
+    Exception raised when IMDS cannot be reached after retries during the instance profile
+    security check. This indicates a transient IMDS failure rather than "not running on EC2",
+    and the worker must not proceed to avoid bypassing the security check.
+    """
+
+    def __init__(self, *, attempts: int) -> None:
+        self._attempts = attempts
+
+    def __str__(self) -> str:  # pragma: no cover
+        return (
+            "IMDS could not be reached after "
+            f"{self._attempts} attempts during instance profile security check. "
+            "Worker cannot confirm instance profile status and must exit."
+        )
+
+
 class BootstrapWithoutWorkerLoad(Exception):
     """
     This exception is raised to worker_bootstrap, and indicates that the
@@ -95,6 +121,13 @@ class WorkerPersistenceInfo:
     worker_id: str
     """The Worker ID"""
 
+    instance_id: str | None = field(
+        default=None,
+    )
+    """The EC2 instance ID of the Worker, if applicable"""
+
+    host_configuration_succeeded: bool | None = field(default=None)
+
     @classmethod
     def load(cls, *, config: Configuration) -> Optional[WorkerPersistenceInfo]:
         """Load the Worker Bootstrap from the Worker Agent state persistence file"""
@@ -110,7 +143,7 @@ class WorkerPersistenceInfo:
         )
 
         with config.worker_state_file.open("r", encoding="utf8") as fh:
-            data: dict[str, str] = json.load(fh)
+            data: dict[str, str | bool] = json.load(fh)
 
         own_fields = set(f.name for f in fields(class_or_instance=WorkerPersistenceInfo))
         selected_data = {key: value for key, value in data.items() if key in own_fields}
@@ -124,7 +157,7 @@ class WorkerPersistenceInfo:
                 )
             )
 
-        return cls(**selected_data)
+        return cls(**cast(Dict[str, Any], selected_data))
 
     def save(self, *, config: Configuration) -> None:
         """Save the Worker Bootstrap to the Worker Agent state persistence file"""
@@ -155,7 +188,7 @@ class WorkerPersistenceInfo:
         config.worker_state_file.touch(mode=stat.S_IWUSR | stat.S_IRUSR, exist_ok=True)
         with config.worker_state_file.open("w", encoding="utf8") as fh:
             json.dump(
-                asdict(self),
+                {k: v for k, v in asdict(self).items() if v is not None},
                 fh,
             )
         _logger.info(
@@ -180,6 +213,9 @@ class WorkerBootstrap:
     log_config: Optional[WorkerLogConfig] = None
     """The log configuration for the Worker"""
 
+    host_config: Optional[WorkerHostConfiguration] = None
+    """The host configuration for the Worker"""
+
 
 def bootstrap_worker(config: Configuration, *, use_existing_worker: bool = True) -> WorkerBootstrap:
     """Contains startup logic to ensure that the Worker is created and started"""
@@ -187,6 +223,11 @@ def bootstrap_worker(config: Configuration, *, use_existing_worker: bool = True)
     # Session that will store AWS Credentials used during the initial bootstrapping until
     # we have obtained Fleet Role Credentials from the service.
     bootstrap_session = Session(profile_name=config.profile)
+
+    # Use the config file region only as a fallback when boto3 cannot resolve one
+    # (e.g. no AWS_DEFAULT_REGION, AWS_REGION, AWS config, or IMDS).
+    if bootstrap_session.region_name is None and config.region is not None:
+        bootstrap_session = Session(profile_name=config.profile, region_name=config.region)
     configure_session_events(boto3_session=bootstrap_session)
 
     # raises: SystemExit
@@ -212,7 +253,7 @@ def bootstrap_worker(config: Configuration, *, use_existing_worker: bool = True)
 
     try:
         # raises: BootstrapWithoutWorkerLoad, SystemExit
-        log_config = _start_worker(
+        log_config, host_config = _start_worker(
             deadline_client=deadline_client,
             config=config,
             worker_id=worker_info.worker_id,
@@ -230,7 +271,7 @@ def bootstrap_worker(config: Configuration, *, use_existing_worker: bool = True)
         )
         return bootstrap_worker(config, use_existing_worker=False)
 
-    # raises: InstanceProfileAttachedError
+    # raises: InstanceProfileAttachedError, IMDSUnreachableError
     _enforce_no_instance_profile_or_stop_worker(
         config=config,
         deadline_client=deadline_client,
@@ -241,6 +282,7 @@ def bootstrap_worker(config: Configuration, *, use_existing_worker: bool = True)
         worker_info=worker_info,
         session=worker_session,
         log_config=log_config,
+        host_config=host_config,
     )
 
 
@@ -263,22 +305,65 @@ def _load_or_create_worker(
     Raises:
         SystemExit - Any error here is unrecoverable, and the Agent should exit.
     """
+    instance_id = _get_instance_id()
 
     worker_info: Optional[WorkerPersistenceInfo] = None
     has_existing_worker = False
     if use_existing_worker:
         worker_info = WorkerPersistenceInfo.load(config=config)
         if worker_info:
-            has_existing_worker = True
-            _logger.info(
-                WorkerLogEvent(
-                    op=WorkerLogEventOp.LOAD,
-                    farm_id=config.farm_id,
-                    fleet_id=config.fleet_id,
-                    worker_id=worker_info.worker_id,
-                    message="Worker identity loaded from prior run.",
+            if (
+                instance_id is not None
+                and worker_info.instance_id is not None
+                and worker_info.instance_id != instance_id
+            ):
+                # This can happen if an AMI is created from an instance that started the worker agent and left behind a
+                # worker persistence file. Ideally the file is removed before creating the AMI but in the event it still
+                # exists, simply create a new worker and replace the file.
+                _logger.warning(
+                    WorkerLogEvent(
+                        op=WorkerLogEventOp.LOAD,
+                        farm_id=config.farm_id,
+                        fleet_id=config.fleet_id,
+                        worker_id=worker_info.worker_id,
+                        message=(
+                            f"Worker state file contains an instance ID ({worker_info.instance_id}) different to that of the running host ({instance_id}). "
+                            "This could be the result of a worker state file being included in the image being launched. "
+                            "For guidance on preparing a worker image, please refer to https://docs.aws.amazon.com/deadline-cloud/latest/developerguide/create-ami.html#prepare-the-instance. "
+                            "Ignoring the persisted worker identity and creating a new worker. "
+                        ),
+                    )
                 )
-            )
+                worker_info = None
+            elif worker_info.instance_id is None and instance_id is not None:
+                # No instance id in the state file could be the result of an upgrade
+                # Add the instance ID to the state file but still load the same worker id.
+                worker_info.instance_id = instance_id
+                _logger.info(
+                    WorkerLogEvent(
+                        op=WorkerLogEventOp.LOAD,
+                        farm_id=config.farm_id,
+                        fleet_id=config.fleet_id,
+                        worker_id=worker_info.worker_id,
+                        message=(
+                            "Worker state file did not contain an instance ID. "
+                            f"Adding instance ID ({worker_info.instance_id}) to worker state file."
+                        ),
+                    )
+                )
+                worker_info.save(config=config)
+                has_existing_worker = True
+            else:
+                has_existing_worker = True
+                _logger.info(
+                    WorkerLogEvent(
+                        op=WorkerLogEventOp.LOAD,
+                        farm_id=config.farm_id,
+                        fleet_id=config.fleet_id,
+                        worker_id=worker_info.worker_id,
+                        message="Worker identity loaded from prior run.",
+                    )
+                )
 
     if not worker_info:
         # Worker creation must be done using bootstrap credentials from the environment
@@ -303,7 +388,7 @@ def _load_or_create_worker(
             # Raises: SystemExit
             sys.exit(1)
         worker_id = create_worker_response["workerId"]
-        worker_info = WorkerPersistenceInfo(worker_id=worker_id)
+        worker_info = WorkerPersistenceInfo(worker_id=worker_id, instance_id=instance_id)
         _logger.info(
             WorkerLogEvent(
                 op=WorkerLogEventOp.CREATE,
@@ -389,7 +474,7 @@ def _start_worker(
     config: Configuration,
     worker_id: str,
     has_existing_worker: bool,
-) -> Optional[WorkerLogConfig]:
+) -> Tuple[Optional[WorkerLogConfig], Optional[WorkerHostConfiguration]]:
     """Updates the Worker in the service to the STARTED state.
 
     Returns:
@@ -397,7 +482,8 @@ def _start_worker(
             contained a log configuration for the Worker Agent to use for writing
             its own logs. The returned WorkerLogConfig is the configuration that it
             should use.
-
+        Optional[WorkerHostConfiguration] -- Non-None if UpdateWorker request contains a
+            host configuration for the Worker Agent to configure the host.
     Raises:
         BootstrapWithoutWorkerLoad
         SystemExit
@@ -450,9 +536,19 @@ def _start_worker(
         )
     )
 
+    logging_config = None
     if log_config := response.get("log"):
-        return construct_worker_log_config(log_config=log_config)
-    return None
+        logging_config = construct_worker_log_config(log_config=log_config)
+
+    host_config = None
+    if response_host_config := response.get("hostConfiguration"):
+        # scriptTimeoutSeconds is technically always there from the backend.
+        host_config = WorkerHostConfiguration(
+            script_body=response_host_config.get("scriptBody", ""),
+            script_timeout_seconds=response_host_config["scriptTimeoutSeconds"],
+        )
+
+    return logging_config, host_config
 
 
 def _enforce_no_instance_profile_or_stop_worker(
@@ -468,6 +564,9 @@ def _enforce_no_instance_profile_or_stop_worker(
 
     If the maximum number of retries is reached, the Worker will attempt to be stopped. This is a
     best-effort attempt and will utilize boto3's default retry behavior.
+
+    If IMDS becomes unreachable (non-timeout error) after retries, the Worker will also be stopped
+    and the error re-raised to cause a non-zero exit.
     """
 
     _logger.debug("Allow instance profile: %s", config.allow_instance_profile)
@@ -476,7 +575,7 @@ def _enforce_no_instance_profile_or_stop_worker(
 
     try:
         _enforce_no_instance_profile()
-    except InstanceProfileAttachedError:
+    except (InstanceProfileAttachedError, IMDSUnreachableError):
         try:
             update_worker(
                 deadline_client=deadline_client,
@@ -520,6 +619,28 @@ def _enforce_no_instance_profile_or_stop_worker(
         raise
 
 
+def _get_instance_id() -> str | None:
+    """
+    This function attempts to query the IMDS /instance-id endpoint for the instance ID.
+    The query will return the instance ID on success, and will return None if the query fails or
+    times out. The timeout is limited to half a second and will occur if running off AWS.
+    """
+    response = _get_metadata("instance-id")
+    if response is None:
+        _logger.info(
+            "IMDS is not reachable. Worker host is not an EC2 instance or IMDs is turned off."
+        )
+        return None
+    _logger.debug("IMDS /instance-id response %d", response.status_code)
+    if response.status_code != 200:
+        _logger.info(
+            f"Error attempting to detect instance ID: Recieved HTTP {response.status_code} from IMDS."
+        )
+        return None
+    _logger.info(f"Worker host is running on instance {response.text}.")
+    return response.text
+
+
 def _enforce_no_instance_profile() -> None:
     """
     This function will query the IMDS /iam/info endpoint in a loop until either:
@@ -528,15 +649,48 @@ def _enforce_no_instance_profile() -> None:
         the host EC2 instance)
     2.  The maximum number of attempts (see INSTANCE_PROFILE_REMOVAL_ATTEMPTS) is reached
         (raises InstanceProfileAttachedError)
+    3.  IMDS returns None — retries with exponential backoff up to IMDS_RETRY_MAX_ATTEMPTS,
+        then raises IMDSUnreachableError. A None response during the security check is treated
+        as a transient IMDS failure, NOT as "not running on EC2", because this function is only
+        called when we already know we need to enforce the instance profile check.
 
     The function will sleep for a number of seconds (see INSTANCE_PROFILE_CHECK_DURATION_SECONDS)
     between attempts.
+
+    Raises:
+        InstanceProfileAttachedError: If the instance profile is still attached after all attempts.
+        IMDSUnreachableError: If IMDS cannot be reached after retries.
     """
     for i in range(INSTANCE_PROFILE_REMOVAL_ATTEMPTS):
-        response = _get_metadata("iam/info")
-        if response is None:
-            _logger.warning("Not running on EC2 but --no-allow-instance-profile argument specified")
-            break
+        # Query IMDS with retry — if IMDS is unreachable (returns None), we cannot
+        # assume "not on EC2" during the security check. Retry with backoff.
+        response = None
+        backoff = IMDS_RETRY_INITIAL_BACKOFF_SECONDS
+        attempts = 0
+        while response is None:
+            response = _get_metadata("iam/info")
+            if response is not None:
+                break
+            attempts += 1
+            if attempts > IMDS_RETRY_MAX_ATTEMPTS:
+                _logger.error(
+                    "IMDS could not be reached after %d attempts. "
+                    "Cannot confirm instance profile status. Worker must exit.",
+                    attempts,
+                )
+                raise IMDSUnreachableError(attempts=attempts)
+            _logger.warning(
+                "IMDS returned no response during instance profile check "
+                "(attempt %d of %d, retry %d of %d). Retrying in %.1fs.",
+                i + 1,
+                INSTANCE_PROFILE_REMOVAL_ATTEMPTS,
+                attempts,
+                IMDS_RETRY_MAX_ATTEMPTS,
+                backoff,
+            )
+            sleep(backoff)
+            backoff = min(backoff * IMDS_RETRY_BACKOFF_FACTOR, IMDS_RETRY_MAX_BACKOFF_SECONDS)
+
         _logger.info("IMDS /iam/info response %d", response.status_code)
         if response.status_code == 404:
             _logger.info("Instance profile disassociated, proceeding to run tasks.")
@@ -573,14 +727,15 @@ def _get_metadata(metadata_type: str) -> requests.Response | None:
         response = requests.put(
             "http://169.254.169.254/latest/api/token",
             headers={"X-aws-ec2-metadata-token-ttl-seconds": "30"},
+            timeout=0.5,  # Non-aws worker hosts will time-out, but the default timeout can be > 20s
         )
         token = response.text
         response = requests.get(
             f"http://169.254.169.254/latest/meta-data/{metadata_type}",
             headers={"X-aws-ec2-metadata-token": token},
         )
-    except ConnectionError:
-        _logger.info("Not running on Ec2, the metadata service was not found!")
+    except Exception:
+        _logger.info("Not running on EC2 or the metadata service was unable to be found!")
         return None
     else:
         return response

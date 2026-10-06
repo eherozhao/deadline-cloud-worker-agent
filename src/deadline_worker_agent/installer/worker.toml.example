@@ -35,6 +35,34 @@
 # The following is the default worker persistence dir on POSIX systems.
 # worker_persistence_dir = "/var/lib/deadline"
 
+
+# The session root directory is a parent directory where worker agent creates per-session
+# subdirectories under. This value is overridden when the DEADLINE_WORKER_SESSION_ROOT_DIR environment
+# variable is set or the --session-root-dir command-line argument is specified.
+#
+# The default session root directory on POSIX systems is "/sessions" and on Windows systems is
+# "C:\ProgramData\Amazon\OpenJD".
+#
+# Uncomment the line below and replace the value with your desired session root directory:
+#
+# session_root_dir = "/sessions"
+
+
+# The session runtime implementation to use. This controls which backend runs OpenJD session
+# actions. Available values:
+#
+#   "python"           - Use the Python OpenJD session implementation
+#   "rust"             - Use the Rust OpenJD session implementation
+#   "service-selected" - Let the service determine the runtime per-session (default)
+#                       (follows the service's per-session runtimeHint; defaults to python when
+#                       no hint is provided)
+#
+# This value is overridden when the --session-runtime command-line argument is specified.
+#
+# By default, the service selects the runtime. To change the session runtime, uncomment the line below:
+#
+# session_runtime = "service-selected"
+
 [aws]
 
 # The worker agent requires initial AWS credentials in order to bootstrap the worker. Bootstrapping
@@ -62,6 +90,16 @@
 # profile = "my_aws_profile_name"
 
 
+# The AWS region to use for the Worker Agent. If not set here, the region is resolved using
+# boto3's default region resolution (e.g. AWS_DEFAULT_REGION, AWS_REGION environment variables,
+# AWS config file, or EC2 instance metadata). Standard AWS environment variables take precedence
+# over this setting.
+#
+# Uncomment the line below and replace the value with your AWS region:
+#
+# region = "us-west-2"
+
+
 # The "allow_ec2_instance_profile" setting controls whether the Worker will run with an EC2 instance
 # profile associated to the host instance. This value is overridden when the
 # DEADLINE_WORKER_ALLOW_INSTANCE_PROFILE environment variable is set using one of the following
@@ -71,8 +109,8 @@
 #
 # or if the --disallow-instance-profile command-line flag is specified.
 #
-# By default, this value is true and the worker agent will run with or without an instance profile
-# if the worker is on an EC2 host. If this value is false, the worker host will query the EC2
+# By default, this value is true and the worker agent will run regardless of whether an instance
+# profile is attached. If this value is set to false, the worker agent will query the EC2
 # instance meta-data service (IMDS) to check for an instance profile. If an instance profile is
 # detected, the worker agent will stop and exit.
 #
@@ -83,8 +121,7 @@
 #  *                                                                                         *
 #  *******************************************************************************************
 #
-# To turn on this feature and have the worker agent not run with an EC2 instance profile,
-# uncomment the line below:
+# To disallow instance profiles, uncomment the line below:
 #
 # allow_ec2_instance_profile = false
 
@@ -214,6 +251,19 @@
 #
 # windows_job_user = "job-user"
 
+# The ARN of an AWS Secrets Manager secret containing the password of the Windows job user.
+# When set, the agent fetches the password from Secrets Manager instead of resetting it to a
+# random value. This is required for domain users and optional for local users.
+# This value is overridden when the DEADLINE_WORKER_WINDOWS_JOB_USER_PASSWORD_ARN environment
+# variable is set or if the --windows-job-user-password-arn command-line flag is specified.
+#
+# The secret value must be a JSON object with a "password" key: {"password": "value"}
+#
+# To use a Secrets Manager secret for the Windows job user password, uncomment the line below
+# and replace with your secret ARN:
+#
+# windows_job_user_password_arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:my-secret-abc123"
+
 # AWS Deadline Cloud may tell the worker to stop. If the "shutdown_on_stop" setting below is true, then the
 # Worker will attempt to shutdown the host system after the Worker has been stopped.
 #
@@ -241,6 +291,47 @@
 # To retain this Session directory after the Session ends, uncomment the line below:
 #
 # retain_session_dir = true
+
+# Whether the worker agent should clean up processes belonging to a session's OS user when the
+# session user is no longer being used in any active sessions. This value is overridden when the
+# DEADLINE_WORKER_CLEANUP_SESSION_USER_PROCESSES environment variable is set using one of the
+# following case-insensitive values:
+#
+#     '0', 'off', 'f', 'false', 'n', 'no', '1', 'on', 't', 'true', 'y', 'yes'.
+#
+# By default this is true. To disable session user process cleanup, uncomment the line below:
+#
+# cleanup_session_user_processes = false
+
+
+# Whether the worker agent should log host metrics (CPU, memory, etc.) periodically.
+# This value is overridden when the DEADLINE_WORKER_HOST_METRICS_LOGGING environment variable
+# is set.
+#
+# By default this is true. To disable host metrics logging, uncomment the line below:
+#
+# host_metrics_logging = false
+
+
+# The interval in seconds between host metrics log messages. Only applies when
+# host_metrics_logging is true. This value is overridden when the
+# DEADLINE_WORKER_HOST_METRICS_LOGGING_INTERVAL_SECONDS environment variable is set.
+#
+# The default is 60 seconds. To change the interval, uncomment the line below:
+#
+# host_metrics_logging_interval_seconds = 60
+
+[telemetry]
+
+# Controls whether telemetry data is collected and sent to AWS. This value is overridden when the
+# DEADLINE_CLOUD_TELEMETRY_OPT_OUT environment variable is set using one of the following
+# case-insensitive values:
+#
+#     '0', 'off', 'f', 'false', 'n', 'no', '1', 'on', 't', 'true', 'y', 'yes'.
+#
+# By default, telemetry is enabled. To opt out, uncomment the line below:
+#
+# opt_out = true
 
 [capabilities]
 

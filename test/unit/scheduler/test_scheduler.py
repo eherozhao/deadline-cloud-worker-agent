@@ -6,8 +6,17 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Generator, Optional
 from unittest.mock import ANY, MagicMock, Mock, call, patch
+import logging
 
-from openjd.sessions import ActionState, ActionStatus, SessionUser, PosixSessionUser
+from deadline_worker_agent.api_models import ManifestInfo
+
+from openjd.sessions import (
+    ActionState,
+    ActionStatus,
+    SessionUser,
+    PosixSessionUser,
+    WindowsSessionUser,
+)
 from botocore.exceptions import ClientError
 import pytest
 import os
@@ -26,12 +35,15 @@ from deadline_worker_agent.scheduler.scheduler import (
 )
 from deadline_worker_agent.scheduler.session_action_status import SessionActionStatus
 from deadline_worker_agent.sessions.job_entities.job_details import (
+    JobAttachmentSettings,
     JobDetails,
     JobRunAsUser,
     JobRunAsWindowsUser,
 )
-from deadline_worker_agent.startup.config import JobsRunAsUserOverride
+from deadline_worker_agent.config import JobsRunAsUserOverride
+from deadline_worker_agent._session_runtime_kind import SessionRuntimeKind
 from deadline_worker_agent.errors import ServiceShutdown
+from deadline_worker_agent.log_messages import LogRecordStringTranslationFilter
 import deadline_worker_agent.scheduler.scheduler as scheduler_mod
 from deadline_worker_agent.aws.deadline import (
     DeadlineRequestError,
@@ -41,6 +53,14 @@ from deadline_worker_agent.aws.deadline import (
 )
 from deadline_worker_agent.file_system_operations import FileSystemPermissionEnum
 from openjd.model import SpecificationRevision
+
+
+@pytest.fixture(autouse=True)
+def log_translation_filter() -> Generator[None, None, None]:
+    string_translation_filter = LogRecordStringTranslationFilter()
+    logging.root.addFilter(string_translation_filter)
+    yield None
+    logging.root.removeFilter(string_translation_filter)
 
 
 @pytest.fixture
@@ -63,6 +83,9 @@ def scheduler(
     job_run_as_user_overrides: JobsRunAsUserOverride,
     boto_session: Mock,
     worker_logs_dir: Path,
+    session_root_dir: Path,
+    # Ensure the log filter is setup
+    log_translation_filter: None,
 ) -> WorkerScheduler:
     """Fixture for a WorkerScheduler instance"""
     return WorkerScheduler(
@@ -75,6 +98,7 @@ def scheduler(
         cleanup_session_user_processes=True,
         worker_persistence_dir=Path("/var/lib/deadline"),
         worker_logs_dir=worker_logs_dir,
+        session_root_dir=session_root_dir,
     )
 
 
@@ -107,9 +131,9 @@ class MockSession(MagicMock):
 
 
 @pytest.fixture()
-def mock_session() -> Generator[None, None, None]:
-    with patch.object(scheduler_mod, "Session", new=MockSession):
-        yield
+def mock_session() -> Generator[MagicMock, None, None]:
+    with patch.object(scheduler_mod, "Session") as mock_session:
+        yield mock_session
 
 
 class TestSchedulerRun:
@@ -685,27 +709,56 @@ class TestSchedulerSync:
         else:
             assert status_as_boto.get("processExitCode", "FAIL") == expected_result
 
+    def test_updated_action_to_boto_with_empty_manifests(self, scheduler: WorkerScheduler) -> None:
+        # GIVEN
+        manifests = [
+            ManifestInfo(
+                outputManifestPath="s3://bucket/path/to/manifest1", outputManifestHash="hash1"
+            ),
+            ManifestInfo(),  # Empty manifest for asset root with no changes
+            ManifestInfo(
+                outputManifestPath="s3://bucket/path/to/manifest3", outputManifestHash="hash3"
+            ),
+        ]
+        action_status = SessionActionStatus(
+            id="1234", status=ActionStatus(state=ActionState.SUCCESS), manifests=manifests
+        )
+
+        # WHEN
+        status_as_boto = scheduler._updated_action_to_boto(action_status)
+
+        # THEN
+        assert "manifests" in status_as_boto
+        assert len(status_as_boto["manifests"]) == 3
+        assert status_as_boto["manifests"][0] == {
+            "outputManifestPath": "s3://bucket/path/to/manifest1",
+            "outputManifestHash": "hash1",
+        }
+        assert status_as_boto["manifests"][1] == {}
+        assert status_as_boto["manifests"][2] == {
+            "outputManifestPath": "s3://bucket/path/to/manifest3",
+            "outputManifestHash": "hash3",
+        }
+
 
 class TestCreateNewSessions:
     """Tests for WorkerScheduler._create_new_sessions"""
 
-    def test_local_logging(
-        self,
-        scheduler: WorkerScheduler,
-        worker_logs_dir: Path,
-    ) -> None:
-        """Tests that when creating a new session, that the WorkerScheduler:
+    @pytest.fixture
+    def queue_id(self) -> str:
+        return "queue-abcdef0123456789abcdef0123456789"
 
-        1.  Provisions a directory for the queue with 700 permissions (read/write/traversal for
-            owner/agent OS user only)
-        2.  Provisions a log file for the session with 600 permissions (read/write permissions for
-            owner/agent OS user only)
-        3.  Forwards the session log file path to the LogConfiguration.from_boto() class method
-        """
-        # GIVEN
-        queue_id = "queue-abcdef0123456789abcdef0123456789"
-        session_id = "session-abcdef0123456789abcdef0123456789"
-        assigned_sessions: dict[str, AssignedSession] = {
+    @pytest.fixture
+    def session_id(self) -> str:
+        return "session-abcdef0123456789abcdef0123456789"
+
+    @pytest.fixture
+    def assigned_sessions(
+        self,
+        queue_id: str,
+        session_id: str,
+    ) -> dict[str, AssignedSession]:
+        return {
             session_id: AssignedSession(
                 queueId=queue_id,
                 jobId="job-abcdef0123456789abcdef0123456789",
@@ -735,6 +788,39 @@ class TestCreateNewSessions:
                 ],
             ),
         }
+
+    @pytest.fixture
+    def mock_datetime(self) -> Generator[MagicMock, None, None]:
+        with patch.object(scheduler_mod, "datetime") as mock_datetime:
+            yield mock_datetime
+
+    @pytest.fixture
+    def mock_datetime_now(self, mock_datetime: MagicMock) -> Generator[MagicMock, None, None]:
+        datetime_now_mock: MagicMock = mock_datetime.now
+        yield datetime_now_mock
+
+    @pytest.fixture
+    def mock_job_entities(self) -> Generator[MagicMock, None, None]:
+        with patch.object(scheduler_mod, "JobEntities") as job_entities_mock:
+            yield job_entities_mock
+
+    def test_local_logging(
+        self,
+        scheduler: WorkerScheduler,
+        worker_logs_dir: Path,
+        queue_id: str,
+        session_id: str,
+        assigned_sessions: dict[str, AssignedSession],
+    ) -> None:
+        """Tests that when creating a new session, that the WorkerScheduler:
+
+        1.  Provisions a directory for the queue with 700 permissions (read/write/traversal for
+            owner/agent OS user only)
+        2.  Provisions a log file for the session with 600 permissions (read/write permissions for
+            owner/agent OS user only)
+        3.  Forwards the session log file path to the LogConfiguration.from_boto() class method
+        """
+        # GIVEN
         queue_log_dir_path = MagicMock()
         session_log_file_path = MagicMock()
 
@@ -882,6 +968,7 @@ class TestCreateNewSessions:
     def test_log_provision_error(
         self,
         scheduler: WorkerScheduler,
+        mock_datetime_now: MagicMock,
     ) -> None:
         """Tests that when a session is assigned with a log provisioning error, that the assigned
         action is marked as FAILED, the rest are marked as NEVER_ATTEMPTED,
@@ -920,18 +1007,16 @@ class TestCreateNewSessions:
                 ],
             ),
         }
-        with patch.object(scheduler_mod, "datetime") as datetime_mock:
-            datetime_now_mock: MagicMock = datetime_mock.now
 
-            # WHEN
-            scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
+        # WHEN
+        scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
 
         # THEN
         for action_num in (1, 2):
             action_id = f"action-{action_num}"
-            assert (
-                action_update := scheduler._action_updates_map.get(action_id, None)
-            ), f"no action update for {action_id}"
+            assert (action_update := scheduler._action_updates_map.get(action_id, None)), (
+                f"no action update for {action_id}"
+            )
             assert action_update.id == action_id
             assert action_update.status is not None
             assert action_update.status.state == ActionState.FAILED
@@ -942,8 +1027,8 @@ class TestCreateNewSessions:
             if action_num == 1:
                 assert action_update.completed_status == "FAILED"
 
-                assert action_update.start_time == datetime_now_mock.return_value
-                assert action_update.end_time == datetime_now_mock.return_value
+                assert action_update.start_time == mock_datetime_now.return_value
+                assert action_update.end_time == mock_datetime_now.return_value
             else:
                 assert action_update.completed_status == "NEVER_ATTEMPTED"
                 assert action_update.start_time is None
@@ -961,6 +1046,9 @@ class TestCreateNewSessions:
         self,
         scheduler: WorkerScheduler,
         job_details_error: Exception,
+        assigned_sessions: dict[str, AssignedSession],
+        mock_datetime_now: MagicMock,
+        mock_job_entities: MagicMock,
     ) -> None:
         """Tests that when a session encounters a job details error, that the first assigned
         action is marked as FAILED, the rest are marked as NEVER_ATTEPTED,
@@ -968,53 +1056,19 @@ class TestCreateNewSessions:
         immediate follow-up UpdateWorkerSchedule request to signal the failure.
         """
         # GIVEN
-        queue_id = "queue-abcdef0123456789abcdef0123456789"
-        session_id = "session-abcdef0123456789abcdef0123456789"
-        assigned_sessions: dict[str, AssignedSession] = {
-            session_id: AssignedSession(
-                queueId=queue_id,
-                jobId="job-abcdef0123456789abcdef0123456789",
-                logConfiguration=LogConfiguration(
-                    logDriver="awslogs",
-                    options={},
-                    parameters={"interval": "15"},
-                ),
-                sessionActions=[
-                    EnvironmentAction(
-                        actionType="ENV_ENTER",
-                        environmentId="env-1",
-                        sessionActionId="action-1",
-                    ),
-                    TaskRunAction(
-                        actionType="TASK_RUN",
-                        parameters={},
-                        sessionActionId="action-2",
-                        stepId="step-1",
-                        taskId="task-1",
-                    ),
-                ],
-            ),
-        }
-
         job_entity_mock = MagicMock()
         job_entity_mock.job_details.side_effect = job_details_error
+        mock_job_entities.return_value = job_entity_mock
 
-        with (
-            patch.object(scheduler_mod, "datetime") as datetime_mock,
-            patch.object(scheduler_mod, "JobEntities") as job_entities_mock,
-        ):
-            job_entities_mock.return_value = job_entity_mock
-            datetime_now_mock: MagicMock = datetime_mock.now
-
-            # WHEN
-            scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
+        # WHEN
+        scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
 
         # THEN
         for action_num in (1, 2):
             action_id = f"action-{action_num}"
-            assert (
-                action_update := scheduler._action_updates_map.get(action_id, None)
-            ), f"no action update for {action_id}"
+            assert (action_update := scheduler._action_updates_map.get(action_id, None)), (
+                f"no action update for {action_id}"
+            )
             assert action_update.id == action_id
             assert action_update.status is not None
             assert action_update.status.state == ActionState.FAILED
@@ -1022,8 +1076,8 @@ class TestCreateNewSessions:
             if action_num == 1:
                 assert action_update.completed_status == "FAILED"
 
-                assert action_update.start_time == datetime_now_mock.return_value
-                assert action_update.end_time == datetime_now_mock.return_value
+                assert action_update.start_time == mock_datetime_now.return_value
+                assert action_update.end_time == mock_datetime_now.return_value
             else:
                 assert action_update.completed_status == "NEVER_ATTEMPTED"
                 assert action_update.start_time is None
@@ -1033,6 +1087,8 @@ class TestCreateNewSessions:
     def test_job_details_run_as_worker_agent_user_windows(
         self,
         scheduler: WorkerScheduler,
+        mock_datetime_now: MagicMock,
+        mock_job_entities: MagicMock,
     ) -> None:
         """Tests that when a session encounters a runAs: WORKER_AGENT_USER for Windows os,
         the first assigned action is marked as FAILED, the rest are marked as NEVER_ATTEPTED,
@@ -1077,30 +1133,25 @@ class TestCreateNewSessions:
             job_run_as_user=JobRunAsUser(is_worker_agent_user=True),
         )
 
-        with (
-            patch.object(scheduler_mod, "datetime") as datetime_mock,
-            patch.object(scheduler_mod, "JobEntities") as job_entities_mock,
-        ):
-            job_entities_mock.return_value = job_entity_mock
-            datetime_now_mock: MagicMock = datetime_mock.now
+        mock_job_entities.return_value = job_entity_mock
 
-            # WHEN
-            scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
+        # WHEN
+        scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
 
         # THEN
         for action_num in (1, 2):
             action_id = f"action-{action_num}"
-            assert (
-                action_update := scheduler._action_updates_map.get(action_id, None)
-            ), f"no action update for {action_id}"
+            assert (action_update := scheduler._action_updates_map.get(action_id, None)), (
+                f"no action update for {action_id}"
+            )
             assert action_update.id == action_id
             assert action_update.status is not None
             assert action_update.status.state == ActionState.FAILED
             assert action_update.status.fail_message == expected_err_msg
             if action_num == 1:
                 assert action_update.completed_status == "FAILED"
-                assert action_update.start_time == datetime_now_mock.return_value
-                assert action_update.end_time == datetime_now_mock.return_value
+                assert action_update.start_time == mock_datetime_now.return_value
+                assert action_update.end_time == mock_datetime_now.return_value
             else:
                 assert action_update.completed_status == "NEVER_ATTEMPTED"
                 assert action_update.start_time is None
@@ -1135,34 +1186,117 @@ class TestCreateNewSessions:
         job_details_run_as: JobRunAsUser,
         scheduler_run_as_agent: bool,
         job_user: SessionUser,
-        mock_session: MockSession,
+        mock_session: MagicMock,
+        assigned_sessions: dict[str, AssignedSession],
+        mock_job_entities: MagicMock,
     ) -> None:
         """Tests that when a session encounters a runAs: WORKER_AGENT_USER,
         and the agent is configured with a JobsRunAsUserOverride, that the session is not
         marked as FAILED
         """
         # GIVEN
-        queue_id = "queue-abcdef0123456789abcdef0123456789"
-        session_id = "session-abcdef0123456789abcdef0123456789"
         if scheduler_run_as_agent:
             scheduler._job_run_as_user_override = JobsRunAsUserOverride(run_as_agent=True)
         else:
             scheduler._job_run_as_user_override = JobsRunAsUserOverride(
                 run_as_agent=False, job_user=job_user
             )
+
+        job_entity_mock = MagicMock()
+        job_entity_mock.job_details.return_value = JobDetails(
+            log_group_name="/aws/deadline/queue-0000",
+            schema_version=SpecificationRevision.v2023_09,
+            job_run_as_user=job_details_run_as,
+        )
+        mock_job_entities.return_value = job_entity_mock
+
+        # WHEN
+        scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        # THEN
+        mock_session.assert_called_once()
+        if scheduler_run_as_agent:
+            mock_session.call_args.kwargs["os_user"] is None
+        else:
+            mock_session.call_args.kwargs["os_user"] is job_user
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows-only test.")
+    def test_domain_user_override_resolves_credentials(
+        self,
+        scheduler: WorkerScheduler,
+        mock_session: MagicMock,
+        assigned_sessions: dict[str, AssignedSession],
+        mock_job_entities: MagicMock,
+    ) -> None:
+        """Tests that when windows_user_settings is configured,
+        the scheduler resolves credentials via WindowsCredentialsResolver
+        and uses the resulting session user."""
+        from deadline_worker_agent.config import WindowsUserSettings
+
+        # GIVEN
+        mock_session_user = MagicMock()
+        mock_resolver = MagicMock()
+        mock_resolver.get_windows_session_user.return_value = mock_session_user
+
+        scheduler._windows_credentials_resolver = mock_resolver
+        override = JobsRunAsUserOverride(run_as_agent=False)
+        object.__setattr__(
+            override,
+            "windows_user_settings",
+            WindowsUserSettings(
+                user="DOMAIN\\job-user",
+                password_arn="arn:aws:secretsmanager:us-west-2:123456789012:secret:test-abc123",
+            ),
+        )
+        scheduler._job_run_as_user_override = override
+
+        job_entity_mock = MagicMock()
+        job_entity_mock.job_details.return_value = JobDetails(
+            log_group_name="/aws/deadline/queue-0000",
+            schema_version=SpecificationRevision.v2023_09,
+            job_run_as_user=JobRunAsUser(is_worker_agent_user=False),
+        )
+        mock_job_entities.return_value = job_entity_mock
+
+        # WHEN
+        scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        # THEN
+        mock_resolver.get_windows_session_user.assert_called_once_with(
+            "DOMAIN\\job-user",
+            "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-abc123",
+        )
+        mock_session.assert_called_once()
+        assert mock_session.call_args.kwargs["os_user"] is mock_session_user
+
+    @pytest.mark.parametrize(
+        argnames="session_root_dir",
+        argvalues=(
+            pytest.param(Path("/foo"), id="1"),
+            pytest.param(Path("/bar"), id="1"),
+        ),
+    )
+    def test_passes_session_root_dir(
+        self,
+        scheduler: WorkerScheduler,
+        mock_session: MagicMock,
+        session_root_dir: Path,
+        mock_job_entities: MagicMock,
+    ) -> None:
+        """Tests that the session_root_dir argument passed when creating the WorkerScheduler is
+        also passed when creating Session objects"""
+        # GIVEN
+        queue_id = "queue-abcdef0123456789abcdef0123456789"
+        session_id = "session-abcdef0123456789abcdef0123456789"
+        scheduler._job_run_as_user_override = JobsRunAsUserOverride(run_as_agent=False)
         assigned_sessions: dict[str, AssignedSession] = {
             session_id: AssignedSession(
                 queueId=queue_id,
                 jobId="job-abcdef0123456789abcdef0123456789",
                 logConfiguration=LogConfiguration(
                     logDriver="awslogs",
-                    options={
-                        "logGroupName": "logGroup",
-                        "logStreamName": "logStreamName",
-                    },
-                    parameters={
-                        "interval": "15",
-                    },
+                    options={},
+                    parameters={"interval": "15"},
                 ),
                 sessionActions=[
                     EnvironmentAction(
@@ -1180,28 +1314,33 @@ class TestCreateNewSessions:
                 ],
             ),
         }
-
         job_entity_mock = MagicMock()
         job_entity_mock.job_details.return_value = JobDetails(
             log_group_name="/aws/deadline/queue-0000",
             schema_version=SpecificationRevision.v2023_09,
-            job_run_as_user=job_details_run_as,
+            job_run_as_user=JobRunAsUser(
+                posix=(
+                    PosixSessionUser(user="username", group="group") if os.name == "posix" else None
+                ),
+                windows=(
+                    WindowsSessionUser(user="username", password="password")
+                    if os.name == "nt"
+                    else None
+                ),
+                windows_settings=None,
+            ),
         )
+        mock_job_entities.return_value = job_entity_mock
 
-        # WHEN
-        with (patch.object(scheduler_mod, "JobEntities") as job_entities_mock,):
-            job_entities_mock.return_value = job_entity_mock
+        with (
+            patch.object(scheduler, "_executor"),
+        ):
+            # WHEN
             scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
 
         # THEN
-        if session_id not in scheduler._sessions:
-            assert session_id in list(scheduler._sessions.keys())
-        assert session_id in scheduler._sessions
-
-        if scheduler_run_as_agent:
-            assert scheduler._sessions[session_id].session.os_user is None
-        else:
-            assert scheduler._sessions[session_id].session.os_user is job_user
+        mock_session.assert_called_once()
+        assert mock_session.call_args.kwargs["session_root_dir"] == session_root_dir
 
     class MockSessionUser(SessionUser):
         user: str
@@ -1315,7 +1454,6 @@ class TestCreateNewSessions:
         expected_result: Optional[SessionUser],
         expected_exception: Optional[str],
     ) -> None:
-
         # WHEN
         if expected_exception is not None:
             with pytest.raises(ValueError, match=expected_exception):
@@ -1340,6 +1478,691 @@ class TestCreateNewSessions:
 
         # THEN
         assert result == expected_result
+
+
+class TestCreateNewSessionsPrefetchSymbolTable:
+    """Tests that the scheduler prefetches the resolved symbol table and passes it to Session"""
+
+    @pytest.fixture
+    def mock_job_entities(self) -> Generator[MagicMock, None, None]:
+        with patch.object(scheduler_mod, "JobEntities") as job_entities_mock:
+            yield job_entities_mock
+
+    def test_passes_prefetched_symbol_table_to_session(
+        self,
+        scheduler: WorkerScheduler,
+        mock_session: MagicMock,
+        mock_job_entities: MagicMock,
+    ) -> None:
+        """Tests that the scheduler calls peek_resolved_symbol_table_json on the queue
+        and passes the result to Session(...) as resolved_symbol_table_json."""
+        # GIVEN
+        table_json = '[{"name":"Job.Name","type":"string","value":"Example Job"}]'
+        queue_id = "queue-abcdef0123456789abcdef0123456789"
+        session_id = "session-abcdef0123456789abcdef0123456789"
+        scheduler._job_run_as_user_override = JobsRunAsUserOverride(run_as_agent=False)
+        assigned_sessions: dict[str, AssignedSession] = {
+            session_id: AssignedSession(
+                queueId=queue_id,
+                jobId="job-abcdef0123456789abcdef0123456789",
+                logConfiguration=LogConfiguration(
+                    logDriver="awslogs",
+                    options={},
+                    parameters={"interval": "15"},
+                ),
+                sessionActions=[
+                    EnvironmentAction(
+                        actionType="ENV_ENTER",
+                        environmentId="env-1",
+                        sessionActionId="action-1",
+                    ),
+                ],
+            ),
+        }
+        job_entity_mock = MagicMock()
+        job_entity_mock.job_details.return_value = JobDetails(
+            log_group_name="/aws/deadline/queue-0000",
+            schema_version=SpecificationRevision.v2023_09,
+            job_run_as_user=JobRunAsUser(
+                posix=(
+                    PosixSessionUser(user="username", group="group") if os.name == "posix" else None
+                ),
+                windows=(
+                    WindowsSessionUser(user="username", password="password")
+                    if os.name == "nt"
+                    else None
+                ),
+                windows_settings=None,
+            ),
+        )
+        mock_job_entities.return_value = job_entity_mock
+
+        with (
+            patch.object(scheduler, "_executor"),
+            patch.object(
+                scheduler_mod.SessionActionQueue,
+                "peek_resolved_symbol_table_json",
+                return_value=table_json,
+            ),
+        ):
+            # WHEN
+            scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        # THEN
+        mock_session.assert_called_once()
+        assert mock_session.call_args.kwargs["resolved_symbol_table_json"] == table_json
+
+
+class TestCreateNewSessionsRuntimeHint:
+    """Tests for runtime hint consumption in WorkerScheduler._create_new_sessions"""
+
+    @pytest.fixture
+    def mock_job_entities(self) -> Generator[MagicMock, None, None]:
+        with patch.object(scheduler_mod, "JobEntities") as job_entities_mock:
+            job_entity_instance = MagicMock()
+            job_entity_instance.job_details.return_value = JobDetails(
+                log_group_name="/aws/deadline/queue-0000",
+                schema_version=SpecificationRevision.v2023_09,
+                job_run_as_user=JobRunAsUser(
+                    posix=(
+                        PosixSessionUser(user="username", group="group")
+                        if os.name == "posix"
+                        else None
+                    ),
+                    windows=(
+                        WindowsSessionUser(user="username", password="password")
+                        if os.name == "nt"
+                        else None
+                    ),
+                    windows_settings=None,
+                ),
+            )
+            job_entities_mock.return_value = job_entity_instance
+            yield job_entities_mock
+
+    @pytest.fixture
+    def scheduler_service_selected(
+        self,
+        farm_id: str,
+        fleet_id: str,
+        worker_id: str,
+        client: MagicMock,
+        job_run_as_user_overrides: JobsRunAsUserOverride,
+        boto_session: Mock,
+        worker_logs_dir: Path,
+        session_root_dir: Path,
+        log_translation_filter: None,
+    ) -> WorkerScheduler:
+        return WorkerScheduler(
+            farm_id=farm_id,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+            deadline=client,
+            job_run_as_user_override=job_run_as_user_overrides,
+            boto_session=boto_session,
+            cleanup_session_user_processes=True,
+            worker_persistence_dir=Path("/var/lib/deadline"),
+            worker_logs_dir=worker_logs_dir,
+            session_root_dir=session_root_dir,
+            session_runtime_kind=SessionRuntimeKind.SERVICE_SELECTED,
+        )
+
+    @pytest.mark.parametrize(
+        argnames=("session_runtime_kind", "metadata", "expected_runtime_kind"),
+        argvalues=(
+            pytest.param(
+                "SERVICE_SELECTED",
+                {"runtimeHint": "rust"},
+                "RUST",
+                id="service_selected_with_rust_hint",
+            ),
+            pytest.param(
+                "SERVICE_SELECTED",
+                {"runtimeHint": "pythonexpr"},
+                "PYTHON",
+                id="service_selected_with_pythonexpr_hint",
+            ),
+            pytest.param(
+                "SERVICE_SELECTED",
+                {},
+                "PYTHON",
+                id="service_selected_empty_metadata",
+            ),
+            pytest.param(
+                "SERVICE_SELECTED",
+                None,
+                "PYTHON",
+                id="service_selected_no_metadata_key",
+            ),
+            pytest.param(
+                "PYTHON",
+                {"runtimeHint": "rust"},
+                "PYTHON",
+                id="python_configured_ignores_hint",
+            ),
+        ),
+    )
+    def test_runtime_hint_selection(
+        self,
+        farm_id: str,
+        fleet_id: str,
+        worker_id: str,
+        client: MagicMock,
+        job_run_as_user_overrides: JobsRunAsUserOverride,
+        boto_session: Mock,
+        worker_logs_dir: Path,
+        session_root_dir: Path,
+        log_translation_filter: None,
+        mock_session: MagicMock,
+        mock_job_entities: MagicMock,
+        session_runtime_kind: str,
+        metadata: Optional[dict[str, str]],
+        expected_runtime_kind: str,
+    ) -> None:
+        """Tests that select_runtime is called correctly and the result is passed to Session."""
+        configured_kind = SessionRuntimeKind[session_runtime_kind]
+        expected_kind = SessionRuntimeKind[expected_runtime_kind]
+
+        sched = WorkerScheduler(
+            farm_id=farm_id,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+            deadline=client,
+            job_run_as_user_override=job_run_as_user_overrides,
+            boto_session=boto_session,
+            cleanup_session_user_processes=True,
+            worker_persistence_dir=Path("/var/lib/deadline"),
+            worker_logs_dir=worker_logs_dir,
+            session_root_dir=session_root_dir,
+            session_runtime_kind=configured_kind,
+        )
+
+        session_id = "session-abcdef0123456789abcdef0123456789"
+        assigned_session = AssignedSession(
+            queueId="queue-abcdef0123456789abcdef0123456789",
+            jobId="job-abcdef0123456789abcdef0123456789",
+            logConfiguration=LogConfiguration(
+                logDriver="awslogs",
+                options={},
+                parameters={"interval": "15"},
+            ),
+            sessionActions=[
+                EnvironmentAction(
+                    actionType="ENV_ENTER",
+                    environmentId="env-1",
+                    sessionActionId="action-1",
+                ),
+            ],
+        )
+        if metadata is not None:
+            assigned_session["metadata"] = metadata
+        assigned_sessions: dict[str, AssignedSession] = {session_id: assigned_session}
+
+        with patch.object(sched, "_executor"):
+            sched._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        mock_session.assert_called_once()
+        assert mock_session.call_args.kwargs["session_runtime_kind"] == expected_kind
+
+    @pytest.mark.parametrize(
+        "bad_hint",
+        [
+            pytest.param("bogus", id="unknown_value"),
+            pytest.param("", id="empty_string"),
+        ],
+    )
+    def test_bad_runtime_hint_fails_session(
+        self,
+        scheduler_service_selected: WorkerScheduler,
+        mock_job_entities: MagicMock,
+        bad_hint: str,
+    ) -> None:
+        """Tests that an invalid runtimeHint (unknown or empty) causes the session actions
+        to be failed without raising an exception."""
+        session_id = "session-abcdef0123456789abcdef0123456789"
+        assigned_sessions: dict[str, AssignedSession] = {
+            session_id: AssignedSession(
+                queueId="queue-abcdef0123456789abcdef0123456789",
+                jobId="job-abcdef0123456789abcdef0123456789",
+                logConfiguration=LogConfiguration(
+                    logDriver="awslogs",
+                    options={},
+                    parameters={"interval": "15"},
+                ),
+                sessionActions=[
+                    EnvironmentAction(
+                        actionType="ENV_ENTER",
+                        environmentId="env-1",
+                        sessionActionId="action-1",
+                    ),
+                    TaskRunAction(
+                        actionType="TASK_RUN",
+                        parameters={},
+                        sessionActionId="action-2",
+                        stepId="step-1",
+                        taskId="task-1",
+                    ),
+                ],
+                metadata={"runtimeHint": bad_hint},
+            ),
+        }
+
+        with patch.object(scheduler_mod, "Session") as mock_session:
+            # No exception should escape
+            scheduler_service_selected._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        # Session must NOT have been constructed for this session
+        mock_session.assert_not_called()
+
+        # Actions should be failed via _action_updates_map
+        action_update = scheduler_service_selected._action_updates_map.get("action-1")
+        assert action_update is not None
+        assert action_update.completed_status == "FAILED"
+        assert action_update.status is not None
+        assert action_update.status.state == ActionState.FAILED
+        assert action_update.status.fail_message is not None
+        assert "Failed to select session runtime" in action_update.status.fail_message
+
+    @pytest.mark.parametrize(
+        argnames=("session_runtime_kind", "metadata", "expected_reason", "expected_runtime_kind"),
+        argvalues=(
+            pytest.param(
+                "SERVICE_SELECTED",
+                {"runtimeHint": "rust"},
+                "hint",
+                "rust",
+                id="service_selected_hint_present",
+            ),
+            pytest.param(
+                "SERVICE_SELECTED",
+                {},
+                "config-default",
+                "python",
+                id="service_selected_no_hint",
+            ),
+            pytest.param(
+                "PYTHON",
+                {"runtimeHint": "rust"},
+                "config-default",
+                "python",
+                id="python_configured",
+            ),
+        ),
+    )
+    def test_runtime_selection_telemetry_event(
+        self,
+        farm_id: str,
+        fleet_id: str,
+        worker_id: str,
+        client: MagicMock,
+        job_run_as_user_overrides: JobsRunAsUserOverride,
+        boto_session: Mock,
+        worker_logs_dir: Path,
+        session_root_dir: Path,
+        log_translation_filter: None,
+        mock_session: MagicMock,
+        mock_job_entities: MagicMock,
+        session_runtime_kind: str,
+        metadata: dict,
+        expected_reason: str,
+        expected_runtime_kind: str,
+    ) -> None:
+        """Tests that the runtime selection telemetry event is emitted with the correct
+        selection_reason after successful runtime selection."""
+        configured_kind = SessionRuntimeKind[session_runtime_kind]
+
+        sched = WorkerScheduler(
+            farm_id=farm_id,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+            deadline=client,
+            job_run_as_user_override=job_run_as_user_overrides,
+            boto_session=boto_session,
+            cleanup_session_user_processes=True,
+            worker_persistence_dir=Path("/var/lib/deadline"),
+            worker_logs_dir=worker_logs_dir,
+            session_root_dir=session_root_dir,
+            session_runtime_kind=configured_kind,
+        )
+
+        session_id = "session-abcdef0123456789abcdef0123456789"
+        assigned_session = AssignedSession(
+            queueId="queue-abcdef0123456789abcdef0123456789",
+            jobId="job-abcdef0123456789abcdef0123456789",
+            logConfiguration=LogConfiguration(
+                logDriver="awslogs",
+                options={},
+                parameters={"interval": "15"},
+            ),
+            sessionActions=[
+                EnvironmentAction(
+                    actionType="ENV_ENTER",
+                    environmentId="env-1",
+                    sessionActionId="action-1",
+                ),
+            ],
+        )
+        if metadata:
+            assigned_session["metadata"] = metadata
+        assigned_sessions: dict[str, AssignedSession] = {session_id: assigned_session}
+
+        with (
+            patch.object(sched, "_executor"),
+            patch.object(
+                scheduler_mod, "record_runtime_selection_telemetry_event"
+            ) as mock_telemetry,
+        ):
+            sched._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        mock_telemetry.assert_called_once()
+        call_kwargs = mock_telemetry.call_args.kwargs
+        assert call_kwargs["runtime_kind"] == expected_runtime_kind
+        assert call_kwargs["selection_reason"] == expected_reason
+        assert call_kwargs["session_runtime_config"] == configured_kind.value
+        assert call_kwargs["runtime_hint"] == metadata.get("runtimeHint")
+        assert call_kwargs["session_id"] == session_id
+        assert call_kwargs["queue_id"] == "queue-abcdef0123456789abcdef0123456789"
+        assert call_kwargs["farm_id"] == sched._farm_id
+        assert call_kwargs["region"] == sched._boto_session.region_name
+
+    @pytest.mark.parametrize(
+        "bad_hint",
+        [
+            pytest.param("bogus", id="unknown_value"),
+            pytest.param("", id="empty_string"),
+        ],
+    )
+    def test_runtime_failure_telemetry_event_on_bad_hint(
+        self,
+        scheduler_service_selected: WorkerScheduler,
+        mock_job_entities: MagicMock,
+        bad_hint: str,
+    ) -> None:
+        """Tests that a runtime failure telemetry event is emitted when select_runtime
+        raises ValueError due to an invalid hint."""
+        session_id = "session-abcdef0123456789abcdef0123456789"
+        assigned_sessions: dict[str, AssignedSession] = {
+            session_id: AssignedSession(
+                queueId="queue-abcdef0123456789abcdef0123456789",
+                jobId="job-abcdef0123456789abcdef0123456789",
+                logConfiguration=LogConfiguration(
+                    logDriver="awslogs",
+                    options={},
+                    parameters={"interval": "15"},
+                ),
+                sessionActions=[
+                    EnvironmentAction(
+                        actionType="ENV_ENTER",
+                        environmentId="env-1",
+                        sessionActionId="action-1",
+                    ),
+                ],
+                metadata={"runtimeHint": bad_hint},
+            ),
+        }
+
+        with (
+            patch.object(scheduler_mod, "Session"),
+            patch.object(
+                scheduler_mod, "record_runtime_failure_telemetry_event"
+            ) as mock_failure_telemetry,
+        ):
+            scheduler_service_selected._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        mock_failure_telemetry.assert_called_once()
+        call_kwargs = mock_failure_telemetry.call_args.kwargs
+        assert call_kwargs["runtime_kind"] == "unknown"
+        # Constant reason: the offending value is already carried verbatim in
+        # runtime_hint, and free exception text must not reach telemetry.
+        assert call_kwargs["failure_reason"] == "invalid runtimeHint"
+        assert call_kwargs["exception_type"] == "ValueError"
+        assert call_kwargs["runtime_hint"] == bad_hint
+        assert call_kwargs["session_id"] == session_id
+        assert call_kwargs["queue_id"] == "queue-abcdef0123456789abcdef0123456789"
+        assert call_kwargs["farm_id"] == scheduler_service_selected._farm_id
+        assert call_kwargs["region"] == scheduler_service_selected._boto_session.region_name
+
+
+class TestTelemetryFailureResilience:
+    """Tests that telemetry emission failures never crash the scheduler.
+
+    Each telemetry call site in _create_new_sessions is guarded so that a
+    RuntimeError (or any Exception subclass) from the telemetry helper is
+    swallowed with a warning, and the surrounding logic completes normally.
+    """
+
+    @pytest.fixture
+    def mock_job_entities(self) -> Generator[MagicMock, None, None]:
+        with patch.object(scheduler_mod, "JobEntities") as job_entities_mock:
+            job_entity_instance = MagicMock()
+            job_entity_instance.job_details.return_value = JobDetails(
+                log_group_name="/aws/deadline/queue-0000",
+                schema_version=SpecificationRevision.v2023_09,
+                job_run_as_user=JobRunAsUser(
+                    posix=(
+                        PosixSessionUser(user="username", group="group")
+                        if os.name == "posix"
+                        else None
+                    ),
+                    windows=(
+                        WindowsSessionUser(user="username", password="password")
+                        if os.name == "nt"
+                        else None
+                    ),
+                    windows_settings=None,
+                ),
+            )
+            job_entities_mock.return_value = job_entity_instance
+            yield job_entities_mock
+
+    @pytest.fixture
+    def scheduler_service_selected(
+        self,
+        farm_id: str,
+        fleet_id: str,
+        worker_id: str,
+        client: MagicMock,
+        job_run_as_user_overrides: JobsRunAsUserOverride,
+        boto_session: Mock,
+        worker_logs_dir: Path,
+        session_root_dir: Path,
+        log_translation_filter: None,
+    ) -> WorkerScheduler:
+        return WorkerScheduler(
+            farm_id=farm_id,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+            deadline=client,
+            job_run_as_user_override=job_run_as_user_overrides,
+            boto_session=boto_session,
+            cleanup_session_user_processes=True,
+            worker_persistence_dir=Path("/var/lib/deadline"),
+            worker_logs_dir=worker_logs_dir,
+            session_root_dir=session_root_dir,
+            session_runtime_kind=SessionRuntimeKind.SERVICE_SELECTED,
+        )
+
+
+class TestCreateNewSessionsConstructionFailure:
+    """Tests that Session(...) construction failures are caught per-session
+    and do not crash the scheduler loop."""
+
+    @pytest.fixture
+    def mock_job_entities(self) -> Generator[MagicMock, None, None]:
+        with patch.object(scheduler_mod, "JobEntities") as job_entities_mock:
+            job_entity_instance = MagicMock()
+            job_entity_instance.job_details.return_value = JobDetails(
+                log_group_name="/aws/deadline/queue-0000",
+                schema_version=SpecificationRevision.v2023_09,
+                job_run_as_user=JobRunAsUser(
+                    posix=(
+                        PosixSessionUser(user="username", group="group")
+                        if os.name == "posix"
+                        else None
+                    ),
+                    windows=(
+                        WindowsSessionUser(user="username", password="password")
+                        if os.name == "nt"
+                        else None
+                    ),
+                    windows_settings=None,
+                ),
+            )
+            job_entities_mock.return_value = job_entity_instance
+            yield job_entities_mock
+
+    @pytest.fixture
+    def scheduler_service_selected(
+        self,
+        farm_id: str,
+        fleet_id: str,
+        worker_id: str,
+        client: MagicMock,
+        job_run_as_user_overrides: JobsRunAsUserOverride,
+        boto_session: Mock,
+        worker_logs_dir: Path,
+        session_root_dir: Path,
+        log_translation_filter: None,
+    ) -> WorkerScheduler:
+        return WorkerScheduler(
+            farm_id=farm_id,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+            deadline=client,
+            job_run_as_user_override=job_run_as_user_overrides,
+            boto_session=boto_session,
+            cleanup_session_user_processes=True,
+            worker_persistence_dir=Path("/var/lib/deadline"),
+            worker_logs_dir=worker_logs_dir,
+            session_root_dir=session_root_dir,
+            session_runtime_kind=SessionRuntimeKind.SERVICE_SELECTED,
+        )
+
+    @pytest.mark.parametrize(
+        argnames=("exc", "expected_failure_reason"),
+        argvalues=(
+            pytest.param(
+                NotImplementedError("RustSessionRuntime adapter is not available on this host"),
+                "session construction failed",
+                id="not_implemented",
+            ),
+            pytest.param(
+                ValueError("Invalid session configuration parameter"),
+                "session construction failed",
+                id="value_error",
+            ),
+            pytest.param(
+                OSError(13, "Permission denied", "/some/user/path"),
+                "Permission denied",
+                id="os_error_with_strerror",
+            ),
+            pytest.param(
+                # Hand-raised OSError has strerror=None; its free-text message can
+                # embed filesystem paths which must never reach telemetry.
+                OSError("failed to write /Users/jdoe/some/private/path"),
+                "session construction failed",
+                id="os_error_no_strerror",
+            ),
+        ),
+    )
+    def test_session_construction_failure_is_handled(
+        self,
+        scheduler_service_selected: WorkerScheduler,
+        mock_job_entities: MagicMock,
+        exc: Exception,
+        expected_failure_reason: str,
+    ) -> None:
+        """Tests that Session(...) raising a known exception type causes the session
+        actions to be failed with telemetry, without raising."""
+        session_id = "session-abcdef0123456789abcdef0123456789"
+        assigned_sessions: dict[str, AssignedSession] = {
+            session_id: AssignedSession(
+                queueId="queue-abcdef0123456789abcdef0123456789",
+                jobId="job-abcdef0123456789abcdef0123456789",
+                logConfiguration=LogConfiguration(
+                    logDriver="awslogs",
+                    options={},
+                    parameters={"interval": "15"},
+                ),
+                sessionActions=[
+                    EnvironmentAction(
+                        actionType="ENV_ENTER",
+                        environmentId="env-1",
+                        sessionActionId="action-1",
+                    ),
+                ],
+                metadata={"runtimeHint": "rust"},
+            ),
+        }
+
+        with (
+            patch.object(scheduler_mod, "Session", side_effect=exc) as mock_session_cls,
+            patch.object(
+                scheduler_mod, "record_runtime_failure_telemetry_event"
+            ) as mock_failure_telemetry,
+        ):
+            # Must not raise
+            scheduler_service_selected._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        # Telemetry emitted with correct details
+        # Scheduler passes worker-scoped correlation fields into Session
+        session_kwargs = mock_session_cls.call_args.kwargs
+        assert session_kwargs["farm_id"] == scheduler_service_selected._farm_id
+        assert session_kwargs["region"] == scheduler_service_selected._boto_session.region_name
+
+        mock_failure_telemetry.assert_called_once()
+        call_kwargs = mock_failure_telemetry.call_args.kwargs
+        assert call_kwargs["runtime_kind"] == "rust"
+        assert call_kwargs["failure_reason"] == expected_failure_reason
+        assert call_kwargs["exception_type"] == type(exc).__name__
+        assert call_kwargs["runtime_hint"] == "rust"
+        assert call_kwargs["session_id"] == session_id
+        assert call_kwargs["queue_id"] == "queue-abcdef0123456789abcdef0123456789"
+        assert call_kwargs["farm_id"] == scheduler_service_selected._farm_id
+        assert call_kwargs["region"] == scheduler_service_selected._boto_session.region_name
+
+        # Actions should be failed
+        action_update = scheduler_service_selected._action_updates_map.get("action-1")
+        assert action_update is not None
+        assert action_update.completed_status == "FAILED"
+        assert action_update.status is not None
+        assert action_update.status.state == ActionState.FAILED
+        assert action_update.status.fail_message is not None
+        assert "Failed to create session" in action_update.status.fail_message
+
+    def test_unexpected_session_construction_exception_propagates(
+        self,
+        scheduler_service_selected: WorkerScheduler,
+        mock_job_entities: MagicMock,
+    ) -> None:
+        """Tests that an unexpected exception type from Session(...) is NOT caught
+        and propagates up, preserving narrow-catch design."""
+        session_id = "session-abcdef0123456789abcdef0123456789"
+        assigned_sessions: dict[str, AssignedSession] = {
+            session_id: AssignedSession(
+                queueId="queue-abcdef0123456789abcdef0123456789",
+                jobId="job-abcdef0123456789abcdef0123456789",
+                logConfiguration=LogConfiguration(
+                    logDriver="awslogs",
+                    options={},
+                    parameters={"interval": "15"},
+                ),
+                sessionActions=[
+                    EnvironmentAction(
+                        actionType="ENV_ENTER",
+                        environmentId="env-1",
+                        sessionActionId="action-1",
+                    ),
+                ],
+                metadata={"runtimeHint": "rust"},
+            ),
+        }
+
+        with (
+            patch.object(scheduler_mod, "Session", side_effect=TypeError("unexpected failure")),
+            pytest.raises(TypeError, match="unexpected failure"),
+        ):
+            scheduler_service_selected._create_new_sessions(assigned_sessions=assigned_sessions)
 
 
 class TestQueueAwsCredentialsManagement:
@@ -1739,3 +2562,153 @@ class TestSessionLogPath:
 
         # THEN
         assert result == queue_log_dir / f"{session_id}.log"
+
+
+class TestSessionEnvVars:
+    """Tests for session environment variable construction."""
+
+    @pytest.fixture
+    def queue_id(self) -> str:
+        return "queue-abcdef0123456789abcdef0123456789"
+
+    @pytest.fixture
+    def session_id(self) -> str:
+        return "session-abcdef0123456789abcdef0123456789"
+
+    @pytest.fixture
+    def assigned_sessions(
+        self,
+        queue_id: str,
+        session_id: str,
+    ) -> dict[str, AssignedSession]:
+        return {
+            session_id: AssignedSession(
+                queueId=queue_id,
+                jobId="job-abcdef0123456789abcdef0123456789",
+                logConfiguration=LogConfiguration(
+                    logDriver="awslogs",
+                    options={
+                        "logGroupName": "logGroup",
+                        "logStreamName": "logStreamName",
+                    },
+                    parameters={"interval": "15"},
+                ),
+                sessionActions=[
+                    EnvironmentAction(
+                        actionType="ENV_ENTER",
+                        environmentId="env-1",
+                        sessionActionId="action-1",
+                    ),
+                    TaskRunAction(
+                        actionType="TASK_RUN",
+                        parameters={},
+                        sessionActionId="action-2",
+                        stepId="step-1",
+                        taskId="task-1",
+                    ),
+                ],
+            ),
+        }
+
+    @pytest.fixture
+    def mock_job_entities(self) -> Generator[MagicMock, None, None]:
+        with patch.object(scheduler_mod, "JobEntities") as job_entities_mock:
+            yield job_entities_mock
+
+    def test_env_includes_job_attachment_vars_when_settings_present(
+        self,
+        scheduler: WorkerScheduler,
+        mock_session: MagicMock,
+        assigned_sessions: dict[str, AssignedSession],
+        mock_job_entities: MagicMock,
+    ) -> None:
+        """
+        GIVEN job_details with job_attachment_settings
+        WHEN _start_session constructs the env dict
+        THEN env contains DEADLINE_JA_S3_BUCKET and DEADLINE_JA_ROOT_PREFIX
+        """
+        # GIVEN
+        job_entity_mock = MagicMock()
+        job_entity_mock.job_details.return_value = JobDetails(
+            log_group_name="/aws/deadline/queue-0000",
+            schema_version=SpecificationRevision.v2023_09,
+            job_run_as_user=JobRunAsUser(
+                posix=(
+                    PosixSessionUser(user="username", group="group") if os.name == "posix" else None
+                ),
+                windows=(
+                    WindowsSessionUser(user="username", password="password")
+                    if os.name == "nt"
+                    else None
+                ),
+            ),
+            job_attachment_settings=JobAttachmentSettings(
+                s3_bucket_name="my-bucket",
+                root_prefix="my-prefix",
+            ),
+            queue_role_arn="arn:aws:iam::123456789012:role/QueueRole",
+        )
+        mock_job_entities.return_value = job_entity_mock
+        scheduler._job_run_as_user_override = JobsRunAsUserOverride(run_as_agent=True)
+
+        # Mock queue credentials with proper string values for session attributes
+        mock_queue_creds = MagicMock()
+        mock_queue_creds.session.credential_process_profile_name = "test-profile"
+        mock_queue_creds.session.aws_config.path = "/tmp/aws_config"
+        mock_queue_creds.session.aws_credentials.path = "/tmp/aws_credentials"
+
+        with (
+            patch.object(scheduler, "_executor"),
+            patch.object(scheduler, "_get_queue_aws_credentials", return_value=mock_queue_creds),
+            patch.object(scheduler_mod, "AssetSync"),
+        ):
+            # WHEN
+            scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        # THEN
+        mock_session.assert_called_once()
+        env = mock_session.call_args.kwargs["env"]
+        assert env["DEADLINE_JA_S3_BUCKET"] == "my-bucket"
+        assert env["DEADLINE_JA_ROOT_PREFIX"] == "my-prefix"
+
+    def test_env_excludes_job_attachment_vars_when_settings_none(
+        self,
+        scheduler: WorkerScheduler,
+        mock_session: MagicMock,
+        assigned_sessions: dict[str, AssignedSession],
+        mock_job_entities: MagicMock,
+    ) -> None:
+        """
+        GIVEN job_details with job_attachment_settings = None
+        WHEN _start_session constructs the env dict
+        THEN env does NOT contain DEADLINE_JA_S3_BUCKET or DEADLINE_JA_ROOT_PREFIX
+        """
+        # GIVEN
+        job_entity_mock = MagicMock()
+        job_entity_mock.job_details.return_value = JobDetails(
+            log_group_name="/aws/deadline/queue-0000",
+            schema_version=SpecificationRevision.v2023_09,
+            job_run_as_user=JobRunAsUser(
+                posix=(
+                    PosixSessionUser(user="username", group="group") if os.name == "posix" else None
+                ),
+                windows=(
+                    WindowsSessionUser(user="username", password="password")
+                    if os.name == "nt"
+                    else None
+                ),
+            ),
+            job_attachment_settings=None,
+        )
+        mock_job_entities.return_value = job_entity_mock
+        scheduler._job_run_as_user_override = JobsRunAsUserOverride(run_as_agent=True)
+
+        with patch.object(scheduler, "_executor"):
+            # WHEN
+            scheduler._create_new_sessions(assigned_sessions=assigned_sessions)
+
+        # THEN
+        mock_session.assert_called_once()
+        env = mock_session.call_args.kwargs["env"]
+        assert "DEADLINE_JA_S3_BUCKET" not in env
+        assert "DEADLINE_JA_ROOT_PREFIX" not in env

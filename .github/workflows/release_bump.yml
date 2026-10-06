@@ -14,66 +14,13 @@ on:
         - major
 
 jobs:
-  UnitTests:
-    name: Unit Tests
-    uses: ./.github/workflows/code_quality.yml
-    with:
-      branch: mainline
-
-  WindowsIntegrationTests:
-    needs: UnitTests
-    name: Windows Integration Tests
-    runs-on: windows-latest
-    permissions:
-      id-token: write
-      contents: read
-    strategy:
-      matrix:
-        python-version: ['3.9', '3.10', '3.11']
-    env:
-        PYTHON: ${{ matrix.python-version }}
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Install Hatch
-      run: |
-        pip install --upgrade hatch
-
-    - name: Run Windows Integration Tests
-      run: hatch run windows-integ-test
-
-  LinuxE2ETests:
-    needs: UnitTests
-    name: Linux E2E Test
-    permissions:
-      id-token: write
-      contents: read
-    uses: aws-deadline/.github/.github/workflows/reusable_e2e_test.yml@mainline
-    secrets: inherit
-    with:
-      repository: ${{ github.event.repository.name }}
-      branch: mainline
-      environment: mainline
-      os: linux
-
-  WindowsE2ETest:
-    needs: UnitTests
-    name: Windows E2E Test
-    permissions:
-      id-token: write
-      contents: read
-    uses: aws-deadline/.github/.github/workflows/reusable_e2e_test.yml@mainline
-    secrets: inherit
-    with:
-      repository: ${{ github.event.repository.name }}
-      branch: mainline
-      environment: mainline
-      os: windows
-
   Bump:
-    needs: LinuxE2ETests
     name: Version Bump
     uses: aws-deadline/.github/.github/workflows/reusable_bump.yml@mainline
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
     secrets: inherit
     with:
       force_version_bump: ${{ inputs.force_version_bump }}

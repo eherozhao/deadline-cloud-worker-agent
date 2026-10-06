@@ -3,35 +3,44 @@
 This test module contains tests that verify the Worker agent's behavior by submitting jobs to the
 Deadline Cloud service and checking that the result/output of the jobs is as we expect it.
 """
-import hashlib
+
 from flaky import flaky
 import json
-import pathlib
 from typing import Any, Dict, List, Optional
 import pytest
 import logging
-from deadline_test_fixtures import Job, DeadlineClient, TaskStatus, EC2InstanceWorker
+from deadline_test_fixtures import (
+    Job,
+    DeadlineClient,
+    PosixSessionUser,
+    TaskStatus,
+    EC2InstanceWorker,
+)
 from e2e.conftest import DeadlineResources
 import backoff
 import boto3
-import botocore.client
 import botocore.config
-import botocore.exceptions
-import re
 import time
 from deadline.client.config import set_setting
 from deadline.client import api
-import uuid
 import os
 import configparser
-import tempfile
-from e2e.utils import wait_for_job_output, submit_sleep_job, submit_custom_job
+from e2e.utils import (
+    job_failure_message,
+    submit_sleep_job,
+    submit_custom_job,
+)
+
 
 LOG = logging.getLogger(__name__)
 
+# launchd service label installed by installer/install_macos.sh on macOS workers.
+MACOS_LAUNCHD_LABEL = "com.amazon.deadline.worker-agent"
 
-@pytest.mark.parametrize("operating_system", [os.environ["OPERATING_SYSTEM"]], indirect=True)
+
 class TestJobSubmission:
+    JOB_OUTPUT_PATH = os.path.join(os.getcwd(), "job_output")
+
     def test_success(
         self,
         deadline_resources,
@@ -52,7 +61,282 @@ class TestJobSubmission:
         job.wait_until_complete(client=deadline_client)
         LOG.info(f"Job result: {job}")
 
-        assert job.task_run_status == TaskStatus.SUCCEEDED
+        assert job.task_run_status == TaskStatus.SUCCEEDED, job_failure_message(
+            job, deadline_client, deadline_resources.queue_a, deadline_resources
+        )
+
+    @pytest.mark.skipif(
+        os.environ["OPERATING_SYSTEM"] == "windows",
+        reason="Linux specific queue crendentials test",
+    )
+    def test_queue_credentials_file_is_secure_from_other_users(
+        self,
+        deadline_resources,
+        session_worker: EC2InstanceWorker,
+        posix_job_user: PosixSessionUser,
+        generic_non_queue_job_user: PosixSessionUser,
+        deadline_client: DeadlineClient,
+    ) -> None:
+        # Test to verify that the queue credentials can never be accessed by a different user on the same machine
+
+        job = submit_custom_job(
+            "Test Sleep",
+            deadline_client,
+            deadline_resources.farm,
+            deadline_resources.queue_a,
+            """
+            #!/usr/bin/env bash
+            sleep 90
+            """,
+        )
+
+        try:
+
+            @backoff.on_predicate(
+                wait_gen=backoff.constant,
+                max_time=120,
+                interval=10,
+            )
+            def is_job_started(current_job: Job) -> bool:
+                current_job.refresh_job_info(client=deadline_client)
+                LOG.info(f"Waiting for job {current_job.id} to be created and running")
+
+                assert current_job.task_run_status not in [
+                    TaskStatus.INTERRUPTING,
+                    TaskStatus.SUSPENDED,
+                    TaskStatus.CANCELED,
+                    TaskStatus.FAILED,
+                    TaskStatus.SUCCEEDED,
+                    TaskStatus.NOT_COMPATIBLE,
+                ], (
+                    f"Job is not in a valid task run status for this test: {current_job.task_run_status}"
+                )
+                return (
+                    current_job.lifecycle_status != "CREATE_IN_PROGRESS"
+                    and current_job.task_run_status == TaskStatus.RUNNING
+                )
+
+            assert is_job_started(job)
+
+            @backoff.on_predicate(backoff.constant, interval=5, max_time=60)
+            def sessions_exist(current_job: Job) -> bool:
+                sessions: list[dict[str, Any]] = deadline_client.list_sessions(
+                    farmId=current_job.farm.id, queueId=current_job.queue.id, jobId=current_job.id
+                ).get("sessions")
+
+                return len(sessions) > 0
+
+            assert sessions_exist(job)
+
+            queue_credentials_directory = f"/var/lib/deadline/queues/{job.queue.id}"
+
+            # Verify that the queue user is able to access the credentials file
+            check_queue_user_can_access_credentials_result = session_worker.send_command(
+                command=f"sudo -u {posix_job_user.user} [ -e '{queue_credentials_directory}/aws_credentials.json' ]"
+            )
+            assert check_queue_user_can_access_credentials_result.exit_code == 0
+
+            # Verify that any other users are not able to access the credential files
+
+            check_other_user_cannot_access_credentials_result = session_worker.send_command(
+                command=f"sudo -u {generic_non_queue_job_user.user} [ -e '{queue_credentials_directory}/aws_credentials.json' ]"
+            )
+
+            assert check_other_user_cannot_access_credentials_result.exit_code != 0
+
+        finally:
+            deadline_client.update_job(
+                farmId=job.farm.id,
+                queueId=job.queue.id,
+                jobId=job.id,
+                targetTaskRunStatus="CANCELED",
+            )
+            job.wait_until_complete(client=deadline_client)
+
+        return
+
+    @pytest.mark.skipif(
+        os.environ["OPERATING_SYSTEM"] == "windows",
+        reason="Linux specific queue crendentials test",
+    )
+    def test_queue_credentials_file_is_secure_from_other_queues(
+        self,
+        deadline_resources,
+        session_worker: EC2InstanceWorker,
+        deadline_client: DeadlineClient,
+    ) -> None:
+        # Test to verify that the queue credentials can never be accessed by a different queue's job user
+
+        job = submit_custom_job(
+            "Test Sleep",
+            deadline_client,
+            deadline_resources.farm,
+            deadline_resources.queue_a,
+            """
+            #!/usr/bin/env bash
+            sleep 60
+            """,
+        )
+
+        try:
+
+            @backoff.on_predicate(
+                wait_gen=backoff.constant,
+                max_time=120,
+                interval=10,
+            )
+            def is_job_started(current_job: Job) -> bool:
+                current_job.refresh_job_info(client=deadline_client)
+                LOG.info(f"Waiting for job {current_job.id} to be created and running")
+
+                assert current_job.task_run_status not in [
+                    TaskStatus.INTERRUPTING,
+                    TaskStatus.SUSPENDED,
+                    TaskStatus.CANCELED,
+                    TaskStatus.FAILED,
+                    TaskStatus.SUCCEEDED,
+                    TaskStatus.NOT_COMPATIBLE,
+                ], (
+                    f"Job is not in a valid task run status for this test: {current_job.task_run_status}"
+                )
+                return (
+                    current_job.lifecycle_status != "CREATE_IN_PROGRESS"
+                    and current_job.task_run_status == TaskStatus.RUNNING
+                )
+
+            assert is_job_started(job)
+
+            @backoff.on_predicate(backoff.constant, interval=5, max_time=60)
+            def sessions_exist(current_job: Job) -> bool:
+                sessions: list[dict[str, Any]] = deadline_client.list_sessions(
+                    farmId=current_job.farm.id, queueId=current_job.queue.id, jobId=current_job.id
+                ).get("sessions")
+
+                return len(sessions) > 0
+
+            assert sessions_exist(job)
+
+            queue_credentials_directory = f"/var/lib/deadline/queues/{job.queue.id}"
+
+            # Verify that another queue's user cannot access the credentials file through a job
+            second_queue_job = submit_custom_job(
+                "Test Getting Primary Queue Credentials File",
+                deadline_client,
+                deadline_resources.farm,
+                deadline_resources.queue_b,
+                f"""
+                #!/usr/bin/env bash
+                cat {queue_credentials_directory}/aws_credentials.json
+                """,
+                max_retries_per_task=0,
+            )
+            try:
+                second_queue_job.wait_until_complete(client=deadline_client)
+                assert second_queue_job.task_run_status == TaskStatus.FAILED
+
+            finally:
+                deadline_client.update_job(
+                    farmId=second_queue_job.farm.id,
+                    queueId=second_queue_job.queue.id,
+                    jobId=second_queue_job.id,
+                    targetTaskRunStatus="CANCELED",
+                )
+                second_queue_job.wait_until_complete(client=deadline_client)
+
+        finally:
+            deadline_client.update_job(
+                farmId=job.farm.id,
+                queueId=job.queue.id,
+                jobId=job.id,
+                targetTaskRunStatus="CANCELED",
+            )
+            job.wait_until_complete(client=deadline_client)
+
+        return
+
+    @pytest.mark.skipif(
+        os.environ["OPERATING_SYSTEM"] == "windows",
+        reason="Linux specific worker log test",
+    )
+    def test_worker_writes_logs_to_disk_securely(
+        self,
+        deadline_resources,
+        session_worker: EC2InstanceWorker,
+        posix_job_user: PosixSessionUser,
+        deadline_client: DeadlineClient,
+    ) -> None:
+        # WHEN
+
+        job = submit_sleep_job(
+            "Test Success Sleep Job",
+            deadline_client,
+            deadline_resources.farm,
+            deadline_resources.queue_a,
+        )
+
+        # THEN
+        LOG.info(f"Waiting for job {job.id} to complete")
+        job.wait_until_complete(client=deadline_client)
+        LOG.info(f"Job result: {job}")
+
+        assert job.task_run_status == TaskStatus.SUCCEEDED, job_failure_message(
+            job, deadline_client, deadline_resources.queue_a, deadline_resources
+        )
+
+        sessions: list[dict[str, Any]] = deadline_client.list_sessions(
+            farmId=job.farm.id,
+            queueId=job.queue.id,
+            jobId=job.id,
+        ).get("sessions")
+        assert sessions
+
+        worker_logs_directory: str = "/var/log/amazon/deadline"
+        # Check that the session log file is accessible by the worker agent user only
+        for session in sessions:
+            session_id: str = session["sessionId"]
+            session_logs_file_path: str = os.path.join(
+                worker_logs_directory, job.queue.id, f"{session_id}.log"
+            )
+
+            check_session_log_exists_result = session_worker.send_command(
+                command=f"sudo -u deadline-worker [ -e '{session_logs_file_path}' ]"
+            )
+            assert (
+                check_session_log_exists_result.exit_code == 0
+            )  # The -e command returns 0 on linux if the file does  exist
+
+            # Check that the session log file is not accessible by the job  user
+            check_session_log_exists_result = session_worker.send_command(
+                command=f"sudo -u {posix_job_user.user} [ -e '{session_logs_file_path}' ]"
+            )
+            assert (
+                check_session_log_exists_result.exit_code == 1
+            )  # The job user should not have access to the file
+
+        # Check that the worker agent log file is accessible by the worker user only
+
+        check_worker_log_exists_result = session_worker.send_command(
+            command=f"sudo -u deadline-worker [ -e '{worker_logs_directory}/worker-agent.log' ]"
+        )
+        assert check_worker_log_exists_result.exit_code == 0
+
+        # Check that the worker agent log file is not accessible by the job user
+        check_worker_log_accessible_by_job_user_result = session_worker.send_command(
+            command=f"sudo -u {posix_job_user.user} [ -e '{worker_logs_directory}/worker-agent.log' ]"
+        )
+        assert check_worker_log_accessible_by_job_user_result.exit_code == 1
+
+        # Check that the worker agent bootstrap log file is accessible by the worker user only
+        check_worker_bootstrap_log_exists_result = session_worker.send_command(
+            command=f"sudo -u deadline-worker [ -e '{worker_logs_directory}/worker-agent-bootstrap.log' ]"
+        )
+        assert check_worker_bootstrap_log_exists_result.exit_code == 0
+
+        # Check that the worker agent bootstrap log file is not accessible by the job user
+        check_worker_bootstrap_log_accessible_by_job_user_result = session_worker.send_command(
+            command=f"sudo -u {posix_job_user.user} [ -e '{worker_logs_directory}/worker-agent-bootstrap.log' ]"
+        )
+        assert check_worker_bootstrap_log_accessible_by_job_user_result.exit_code == 1
 
     @pytest.mark.parametrize(
         "run_actions,environment_actions, expected_failed_action",
@@ -64,17 +348,24 @@ class TestJobSubmission:
                     },
                 },
                 {
-                    "onEnter": {
-                        "command": "whoami",
-                    },
+                    "onEnter": (
+                        {"command": "echo", "args": ["PASS: Environment entered"]}
+                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                        else {
+                            "command": "powershell",
+                            "args": ["Write-Output 'PASS: Environment entered'"],
+                        }
+                    ),
                 },
                 "taskRun",
             ),
             (
                 {
-                    "onRun": {
-                        "command": "whoami",
-                    },
+                    "onRun": (
+                        {"command": "echo", "args": ["PASS: Task ran"]}
+                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                        else {"command": "powershell", "args": ["Write-Output 'PASS: Task ran'"]}
+                    ),
                 },
                 {
                     "onEnter": {
@@ -85,14 +376,21 @@ class TestJobSubmission:
             ),
             (
                 {
-                    "onRun": {
-                        "command": "whoami",
-                    },
+                    "onRun": (
+                        {"command": "echo", "args": ["PASS: Task ran"]}
+                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                        else {"command": "powershell", "args": ["Write-Output 'PASS: Task ran'"]}
+                    ),
                 },
                 {
-                    "onEnter": {
-                        "command": "whoami",
-                    },
+                    "onEnter": (
+                        {"command": "echo", "args": ["PASS: Environment entered"]}
+                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                        else {
+                            "command": "powershell",
+                            "args": ["Write-Output 'PASS: Environment entered'"],
+                        }
+                    ),
                     "onExit": {
                         "command": "noneexistentcommand",  # This will fail
                     },
@@ -110,12 +408,12 @@ class TestJobSubmission:
         environment_actions: Dict[str, Any],
         expected_failed_action: str,
     ) -> None:
-
         job: Job = Job.submit(
             client=deadline_client,
             farm=deadline_resources.farm,
             queue=deadline_resources.queue_a,
             priority=98,
+            max_retries_per_task=0,
             template={
                 "specificationVersion": "jobtemplate-2023-09",
                 "name": f"jobactionfail-{expected_failed_action}",
@@ -157,16 +455,16 @@ class TestJobSubmission:
                     sessionId=session["sessionId"],
                 ).get("sessionActions")
 
-                logging.info(f"Session actions: {session_actions}")
+                LOG.info(f"Session actions: {session_actions}")
                 for session_action in session_actions:
                     # Session action should be failed IFF it's the expected action to fail
                     if expected_failed_action in session_action["definition"]:
                         if session_action["status"] == "FAILED":
                             found_failed_session_action = True
                     else:
-                        assert (
-                            session_action["status"] != "FAILED"
-                        ), f"Session action that should not have failed is in FAILED status. {session_action}"
+                        assert session_action["status"] != "FAILED", (
+                            f"Session action that should not have failed is in FAILED status. {session_action}"
+                        )
             return found_failed_session_action
 
         sessions: list[dict[str, Any]] = deadline_client.list_sessions(
@@ -206,12 +504,12 @@ class TestJobSubmission:
                                 "onRun": {
                                     "command": (
                                         "/bin/sleep"
-                                        if os.environ["OPERATING_SYSTEM"] == "linux"
+                                        if os.environ["OPERATING_SYSTEM"] != "windows"
                                         else "powershell"
                                     ),
                                     "args": (
                                         ["40"]
-                                        if os.environ["OPERATING_SYSTEM"] == "linux"
+                                        if os.environ["OPERATING_SYSTEM"] != "windows"
                                         else ["ping", "localhost", "-n", "40"]
                                     ),
                                     "timeout": 1,  # Times out in 1 second
@@ -244,7 +542,7 @@ class TestJobSubmission:
                 sessionId=session["sessionId"],
             ).get("sessionActions")
 
-            logging.info(f"Session Actions: {session_actions}")
+            LOG.info(f"Session Actions: {session_actions}")
             for session_action in session_actions:
                 # taskRun session action should be failed
                 if "taskRun" in session_action["definition"]:
@@ -262,7 +560,9 @@ class TestJobSubmission:
                         "status"
                     ] == "FAILED" and "TIMEOUT" in get_session_action_response.get(
                         "progressMessage", ""
-                    ), f"taskRun action should have FAILED {get_session_action_response} with 'TIMEOUT' in the progressMessage"
+                    ), (
+                        f"taskRun action should have FAILED {get_session_action_response} with 'TIMEOUT' in the progressMessage"
+                    )
 
         assert found_task_run_action
 
@@ -274,13 +574,13 @@ class TestJobSubmission:
                     "onRun": {
                         "command": (
                             "/bin/sleep"
-                            if os.environ["OPERATING_SYSTEM"] == "linux"
+                            if os.environ["OPERATING_SYSTEM"] != "windows"
                             else "powershell"
                         ),
                         "args": (
-                            ["40"]
-                            if os.environ["OPERATING_SYSTEM"] == "linux"
-                            else ["ping", "localhost", "-n", "40"]
+                            ["300"]
+                            if os.environ["OPERATING_SYSTEM"] != "windows"
+                            else ["ping", "localhost", "-n", "300"]
                         ),
                         "cancelation": {
                             "mode": "NOTIFY_THEN_TERMINATE",
@@ -289,29 +589,36 @@ class TestJobSubmission:
                     },
                 },
                 {
-                    "onEnter": {
-                        "command": "whoami",
-                    },
+                    "onEnter": (
+                        {"command": "echo", "args": ["PASS: Environment entered"]}
+                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                        else {
+                            "command": "powershell",
+                            "args": ["Write-Output 'PASS: Environment entered'"],
+                        }
+                    ),
                 },
                 "taskRun",
             ),
             (
                 {
-                    "onRun": {
-                        "command": "whoami",
-                    },
+                    "onRun": (
+                        {"command": "echo", "args": ["PASS: Task ran"]}
+                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                        else {"command": "powershell", "args": ["Write-Output 'PASS: Task ran'"]}
+                    ),
                 },
                 {
                     "onEnter": {
                         "command": (
                             "/bin/sleep"
-                            if os.environ["OPERATING_SYSTEM"] == "linux"
+                            if os.environ["OPERATING_SYSTEM"] != "windows"
                             else "powershell"
                         ),
                         "args": (
-                            ["40"]
-                            if os.environ["OPERATING_SYSTEM"] == "linux"
-                            else ["ping", "localhost", "-n", "40"]
+                            ["300"]
+                            if os.environ["OPERATING_SYSTEM"] != "windows"
+                            else ["ping", "localhost", "-n", "300"]
                         ),
                         "cancelation": {
                             "mode": "NOTIFY_THEN_TERMINATE",
@@ -372,12 +679,12 @@ class TestJobSubmission:
             max_time=120,
             interval=10,
         )
-        def is_job_started(current_job: Job) -> bool:
+        def is_job_created(current_job: Job) -> bool:
             current_job.refresh_job_info(client=deadline_client)
             LOG.info(f"Waiting for job {current_job.id} to be created")
             return current_job.lifecycle_status != "CREATE_IN_PROGRESS"
 
-        assert is_job_started(job)
+        assert is_job_created(job)
 
         @backoff.on_predicate(
             wait_gen=backoff.constant,
@@ -421,15 +728,20 @@ class TestJobSubmission:
 
                 LOG.info(f"Session Actions: {session_actions}")
                 for session_action in session_actions:
-
                     # Session action should be canceled if it's the action we expect to be canceled
                     if expected_canceled_action in session_action["definition"]:
                         if session_action["status"] == "CANCELED":
                             found_canceled_session_action = True
+                    elif "envExit" in session_action["definition"]:
+                        # envExit should always run no matter what
+                        if session_action["status"] != "SUCCEEDED":
+                            return False
                     else:
-                        assert (
-                            session_action["status"] != "CANCELED"
-                        )  # This should not happen at all, so we fast exit
+                        if expected_canceled_action == "envEnter":
+                            # If we canceled the envEnter, everything else should have been NEVER_ATTEMPTED
+                            assert session_action["status"] == "NEVER_ATTEMPTED"
+                        else:
+                            assert session_action["status"] == "SUCCEEDED"
             return found_canceled_session_action
 
         sessions: list[dict[str, Any]] = deadline_client.list_sessions(
@@ -447,19 +759,29 @@ class TestJobSubmission:
     ) -> None:
         # Tests that when running a job session action with a trap for SIGINT, the corresponding session action is canceled almost immediately.
         action_script: str = (
-            "#!/usr/bin/env bash\n trap 'exit 0' SIGINT\n bash\n\n sleep 300\n "
-            if os.environ["OPERATING_SYSTEM"] == "linux"
-            else """try
+            "#!/usr/bin/env bash\n"
+            "echo '--- STEP: Long sleep with SIGINT trap ---'\n"
+            "echo 'Setting up SIGINT trap and sleeping 300s'\n"
+            "trap 'echo PASS: Received SIGINT, exiting; exit 0' SIGINT\n"
+            "bash\n\nsleep 300\n"
+            "echo 'FAIL: Sleep completed without cancellation'\n"
+            "exit 1\n"
+            if os.environ["OPERATING_SYSTEM"] != "windows"
+            else """Write-Output '--- STEP: Long sleep with cancel trap ---'
+                Write-Output 'Sleeping 300s, waiting for cancellation'
+                try
                 {
                     Start-Sleep -Seconds 300
+                    Write-Output 'FAIL: Sleep completed without cancellation'
+                    exit 1
                 }
                 finally
                 {
+                    Write-Output 'PASS: Received cancellation signal'
                     Exit
                 }"""
         )
 
-        environment_exit_id = str(uuid.uuid4())
         # Submit a job that either sleeps a long time during envEnter, or taskRun, depending on the test setting
         job: Job = Job.submit(
             client=deadline_client,
@@ -469,6 +791,7 @@ class TestJobSubmission:
             template={
                 "specificationVersion": "jobtemplate-2023-09",
                 "name": f"jobactioncanceltrap-{expected_canceled_action}",
+                "description": f"Verifies that {expected_canceled_action} action is canceled promptly when SIGINT trap is set",
                 "steps": [
                     {
                         "name": "Step0",
@@ -484,10 +807,10 @@ class TestJobSubmission:
                             "actions": {
                                 "onRun": (
                                     {"command": "{{ Task.File.runScript }}"}
-                                    if os.environ["OPERATING_SYSTEM"] == "linux"
+                                    if os.environ["OPERATING_SYSTEM"] != "windows"
                                     else {
                                         "command": "powershell",
-                                        "args": ["{{ Task.File.runScript }}"],
+                                        "args": ["{{ Task.File.runScript }}"],  # type: ignore[dict-item]
                                     }
                                 ),
                             },
@@ -499,7 +822,11 @@ class TestJobSubmission:
                                     "data": (
                                         action_script
                                         if expected_canceled_action == "taskRun"
-                                        else "whoami"
+                                        else (
+                                            "#!/usr/bin/env bash\necho 'PASS: Task ran'\n"
+                                            if os.environ["OPERATING_SYSTEM"] != "windows"
+                                            else "Write-Output 'PASS: Task ran'\n"
+                                        )
                                     ),
                                     **(
                                         {"filename": "sleepscript.ps1"}
@@ -519,33 +846,34 @@ class TestJobSubmission:
                                 "onEnter": (
                                     (
                                         {"command": "{{ Env.File.runScript }}"}
-                                        if os.environ["OPERATING_SYSTEM"] == "linux"
+                                        if os.environ["OPERATING_SYSTEM"] != "windows"
                                         else {
                                             "command": "powershell",
-                                            "args": ["{{ Env.File.runScript }}"],
+                                            "args": ["{{ Env.File.runScript }}"],  # type: ignore[dict-item]
                                         }
                                     )
                                     if expected_canceled_action == "envEnter"
-                                    else {"command": "whoami"}
-                                ),
-                                "onExit": (
-                                    (
-                                        {
-                                            "command": "echo",
-                                            "args": ["Environment exit " + environment_exit_id],
-                                        }
-                                        if os.environ["OPERATING_SYSTEM"] == "linux"
+                                    else (
+                                        {"command": "echo", "args": ["PASS: Environment entered"]}
+                                        if os.environ["OPERATING_SYSTEM"] != "windows"
                                         else {
                                             "command": "powershell",
-                                            "args": [
-                                                '"Environment"',
-                                                "+",
-                                                '" exit "',
-                                                "+",
-                                                f'"{environment_exit_id}"',
-                                            ],
+                                            "args": ["Write-Output 'PASS: Environment entered'"],
                                         }
                                     )
+                                ),
+                                "onExit": (
+                                    {
+                                        "command": "echo",
+                                        "args": ["Environment exit ran successfully"],
+                                    }
+                                    if os.environ["OPERATING_SYSTEM"] != "windows"
+                                    else {
+                                        "command": "powershell",
+                                        "args": [
+                                            "Write-Output 'Environment exit ran successfully'"
+                                        ],
+                                    }
                                 ),
                             },
                             "embeddedFiles": [
@@ -556,7 +884,11 @@ class TestJobSubmission:
                                     "data": (
                                         action_script
                                         if expected_canceled_action == "envEnter"
-                                        else "whoami"
+                                        else (
+                                            "#!/usr/bin/env bash\necho 'PASS: Environment entered'\n"
+                                            if os.environ["OPERATING_SYSTEM"] != "windows"
+                                            else "Write-Output 'PASS: Environment entered'\n"
+                                        )
                                     ),
                                     **(
                                         {"filename": "sleepscript.ps1"}
@@ -576,12 +908,12 @@ class TestJobSubmission:
             max_time=120,
             interval=10,
         )
-        def is_job_started(current_job: Job) -> bool:
+        def is_job_created(current_job: Job) -> bool:
             current_job.refresh_job_info(client=deadline_client)
             logging.info(f"Waiting for job {current_job.id} to be created")
             return current_job.lifecycle_status != "CREATE_IN_PROGRESS"
 
-        assert is_job_started(job)
+        assert is_job_created(job)
 
         @backoff.on_predicate(
             wait_gen=backoff.constant,
@@ -605,7 +937,6 @@ class TestJobSubmission:
 
                 logging.info(f"Session Actions: {session_actions}")
                 for session_action in session_actions:
-
                     # Session action should be canceled if it's the action we expect to be canceled
                     if expected_canceled_action in session_action["definition"]:
                         if session_action["status"] == "RUNNING":
@@ -623,7 +954,7 @@ class TestJobSubmission:
 
         @backoff.on_predicate(
             wait_gen=backoff.constant,
-            max_time=60,
+            max_time=70,
             interval=5,
         )
         def is_expected_session_action_canceled(sessions) -> bool:
@@ -638,7 +969,6 @@ class TestJobSubmission:
 
                 logging.info(f"Session Actions: {session_actions}")
                 for session_action in session_actions:
-
                     # Session action should be canceled if it's the action we expect to be canceled
                     if expected_canceled_action in session_action["definition"]:
                         if session_action["status"] == "CANCELED":
@@ -660,13 +990,42 @@ class TestJobSubmission:
 
         # Verify that envExit was ran, if the action being canceled in question is the taskRun, not the envEnter
         if expected_canceled_action == "taskRun":
-            job.assert_single_task_log_contains(
-                deadline_client=deadline_client,
-                logs_client=boto3.client(
-                    "logs",
-                    config=botocore.config.Config(retries={"max_attempts": 10, "mode": "adaptive"}),
-                ),
-                expected_pattern=rf'{"Environment exit " + environment_exit_id}',
+            sessions_after: list[dict[str, Any]] = deadline_client.list_sessions(
+                farmId=job.farm.id, queueId=job.queue.id, jobId=job.id
+            ).get("sessions")
+
+            env_exit_status: Optional[str] = None
+            env_exit_action_id: Optional[str] = None
+            env_exit_session_id: Optional[str] = None
+
+            @backoff.on_predicate(
+                wait_gen=backoff.constant,
+                max_time=60,
+                interval=10,
+            )
+            def is_env_exit_succeeded() -> bool:
+                nonlocal env_exit_status, env_exit_action_id, env_exit_session_id
+                for session in sessions_after:
+                    session_actions: list[dict[str, Any]] = deadline_client.list_session_actions(
+                        farmId=job.farm.id,
+                        queueId=job.queue.id,
+                        jobId=job.id,
+                        sessionId=session["sessionId"],
+                    ).get("sessionActions")
+                    for session_action in session_actions:
+                        if "envExit" in session_action["definition"]:
+                            env_exit_status = session_action["status"]
+                            env_exit_action_id = session_action["sessionActionId"]
+                            env_exit_session_id = session["sessionId"]
+                            return env_exit_status == "SUCCEEDED"
+                return False
+
+            assert is_env_exit_succeeded(), (
+                f"Expected envExit session action to have SUCCEEDED, got: {env_exit_status}"
+                f" (session: {env_exit_session_id}, action: {env_exit_action_id})\n"
+                + job_failure_message(
+                    job, deadline_client, deadline_resources.queue_a, deadline_resources
+                )
             )
 
         # Test that worker continues polling for work
@@ -682,9 +1041,12 @@ class TestJobSubmission:
         job.wait_until_complete(client=deadline_client)
         LOG.info(f"Job result: {job}")
 
-        assert (
-            job.task_run_status == TaskStatus.SUCCEEDED
-        ), "Worker failed to continue polling for work after job cancelation"
+        assert job.task_run_status == TaskStatus.SUCCEEDED, (
+            "Worker failed to continue polling for work after job cancelation\n"
+            + job_failure_message(
+                job, deadline_client, deadline_resources.queue_a, deadline_resources
+            )
+        )
 
     @flaky(max_runs=3, min_passes=1)  # Flaky as sync input sometimes completes before expected.
     def test_worker_reports_canceled_sync_input_actions_as_canceled(
@@ -731,13 +1093,23 @@ class TestJobSubmission:
                     }
                 )
             )
+
+        # 100 meg file.    10,000,000
+        large_file = "A" * 100000000
+
         # Create the input files to make sync inputs take a relatively long time
         files_path: str = os.path.join(tmp_path, "files")
         os.mkdir(files_path)
-        for i in range(2000):
-            file_name: str = os.path.join(files_path, f"input_file_{i+1}.txt")
+        for i in range(6000):
+            file_name: str = os.path.join(files_path, f"input_file_{i + 1}.txt")
             with open(file_name, "w+") as input_file:
-                input_file.write(f"{i}")
+                if i % 1000 == 0:
+                    # Create some big files (1GB each) so the syncInputAttachments don't fail due to low transfer rates
+                    # Write 10 100 meg buffers to reduce memory usage.
+                    for _ in range(10):
+                        input_file.write(large_file)
+                else:
+                    input_file.write(f"{i}")
         config = configparser.ConfigParser()
 
         set_setting("defaults.farm_id", deadline_resources.farm.id, config)
@@ -783,7 +1155,7 @@ class TestJobSubmission:
                     jobId=job.id,
                     sessionId=session["sessionId"],
                 ).get("sessionActions")
-                logging.info(f"Session actions: {session_actions}")
+                LOG.info(f"Session actions: {session_actions}")
                 for session_action in session_actions:
                     if "syncInputJobAttachments" in session_action["definition"]:
                         if session_action["status"] in ["ASSIGNED", "RUNNING"]:
@@ -817,7 +1189,7 @@ class TestJobSubmission:
                     jobId=job.id,
                     sessionId=session["sessionId"],
                 ).get("sessionActions")
-                logging.info(f"Session actions: {session_actions}")
+                LOG.info(f"Session actions: {session_actions}")
                 for session_action in session_actions:
                     # Session action should be canceled if it's the action we expect to be canceled
                     if "syncInputJobAttachments" in session_action["definition"]:
@@ -835,6 +1207,217 @@ class TestJobSubmission:
         ).get("sessions")
 
         assert sync_input_actions_are_canceled(sessions)
+
+    def test_worker_reports_never_attempted_tasks_if_task_is_canceled(
+        self,
+        deadline_resources: DeadlineResources,
+        deadline_client: DeadlineClient,
+        session_worker: EC2InstanceWorker,
+    ) -> None:
+        # Tests that if a taskRun action is cancelled, all remaining taskRun actions that depend on it will be NEVER_ATTEMPTED
+
+        step_one_name = "StepOneSucceeded"
+        step_two_name = "StepTwoToCancel"
+        step_three_name = "StepThreeNeverAttempted"
+        job: Job = Job.submit(
+            client=deadline_client,
+            farm=deadline_resources.farm,
+            queue=deadline_resources.queue_a,
+            priority=98,
+            template={
+                "specificationVersion": "jobtemplate-2023-09",
+                "name": "TestSecondTaskRunCancelled",
+                "jobEnvironments": [
+                    {
+                        "name": "WhoAmiJobEnvironment",
+                        "script": {
+                            "actions": {
+                                "onEnter": ({"command": "whoami"}),
+                                "onExit": ({"command": "whoami"}),
+                            },
+                        },
+                    },
+                ],
+                "steps": [
+                    {
+                        "name": step_one_name,
+                        "hostRequirements": {
+                            "attributes": [
+                                {
+                                    "name": "attr.worker.os.family",
+                                    "allOf": [os.environ["OPERATING_SYSTEM"]],
+                                }
+                            ]
+                        },
+                        "script": {
+                            "actions": {
+                                "onRun": {
+                                    "command": (
+                                        "/bin/sleep"
+                                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                                        else "powershell"
+                                    ),
+                                    "args": (
+                                        ["1"]
+                                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                                        else ["ping", "localhost", "-n", "1"]
+                                    ),
+                                },
+                            }
+                        },
+                    },
+                    {
+                        "name": step_two_name,
+                        "hostRequirements": {
+                            "attributes": [
+                                {
+                                    "name": "attr.worker.os.family",
+                                    "allOf": [os.environ["OPERATING_SYSTEM"]],
+                                }
+                            ]
+                        },
+                        "dependencies": [{"dependsOn": step_one_name}],
+                        "script": {
+                            "actions": {
+                                "onRun": {
+                                    "command": (
+                                        "/bin/sleep"
+                                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                                        else "powershell"
+                                    ),
+                                    "args": (
+                                        ["120"]
+                                        if os.environ["OPERATING_SYSTEM"] != "windows"
+                                        else ["ping", "localhost", "-n", "120"]
+                                    ),
+                                    "cancelation": {
+                                        "mode": "NOTIFY_THEN_TERMINATE",
+                                        "notifyPeriodInSeconds": 1,
+                                    },
+                                },
+                            }
+                        },
+                    },
+                    {
+                        "name": step_three_name,
+                        "hostRequirements": {
+                            "attributes": [
+                                {
+                                    "name": "attr.worker.os.family",
+                                    "allOf": [os.environ["OPERATING_SYSTEM"]],
+                                }
+                            ]
+                        },
+                        "dependencies": [{"dependsOn": step_two_name}],
+                        "script": {
+                            "actions": {
+                                "onRun": {"command": "whoami"},
+                            }
+                        },
+                    },
+                ],
+            },
+        )
+
+        # Wait for the job to start
+
+        @backoff.on_predicate(
+            wait_gen=backoff.constant,
+            max_time=120,
+            interval=10,
+        )
+        def is_job_started_with_sessions(current_job: Job) -> bool:
+            current_job.refresh_job_info(client=deadline_client)
+            LOG.info(f"Waiting for job {current_job.id} to be created and running")
+            if current_job.lifecycle_status == "CREATE_IN_PROGRESS":
+                return False
+            sessions: list[dict[str, Any]] = deadline_client.list_sessions(
+                farmId=job.farm.id, queueId=job.queue.id, jobId=job.id
+            ).get("sessions")
+            if sessions and len(sessions) > 0:
+                return True
+            return False
+
+        assert is_job_started_with_sessions(job)
+
+        # Find both the SUCCEEDED and RUNNING session action IDs
+
+        @backoff.on_exception(
+            backoff.constant,
+            Exception,
+            max_time=90,
+            interval=5,
+        )
+        def find_succeeded_and_running_actions() -> tuple[str, str]:
+            found_succeeded_action_id: Optional[str] = None
+            found_running_action_id: Optional[str] = None
+
+            sessions: list[dict[str, Any]] = deadline_client.list_sessions(
+                farmId=job.farm.id, queueId=job.queue.id, jobId=job.id
+            ).get("sessions")
+
+            for session in sessions:
+                session_actions: list[dict[str, Any]] = deadline_client.list_session_actions(
+                    farmId=job.farm.id,
+                    queueId=job.queue.id,
+                    jobId=job.id,
+                    sessionId=session["sessionId"],
+                ).get("sessionActions")
+                for session_action in session_actions:
+                    definition: dict[str, Any] = session_action["definition"]
+                    if "taskRun" in definition:
+                        if session_action["status"] == "SUCCEEDED":
+                            found_succeeded_action_id = session_action["sessionActionId"]
+                        elif session_action["status"] == "RUNNING":
+                            found_running_action_id = session_action["sessionActionId"]
+
+            assert found_succeeded_action_id is not None
+            assert found_running_action_id is not None
+
+            return found_succeeded_action_id, found_running_action_id
+
+        succeeded_action_id, running_action_id = find_succeeded_and_running_actions()
+        deadline_client.update_job(
+            farmId=job.farm.id,
+            queueId=job.queue.id,
+            jobId=job.id,
+            targetTaskRunStatus="CANCELED",
+        )
+
+        # Wait for the job to be canceled
+
+        job.wait_until_complete(client=deadline_client)
+
+        sessions: list[dict[str, Any]] = deadline_client.list_sessions(
+            farmId=job.farm.id, queueId=job.queue.id, jobId=job.id
+        ).get("sessions")
+        for session in sessions:
+            session_actions: list[dict[str, Any]] = deadline_client.list_session_actions(
+                farmId=job.farm.id,
+                queueId=job.queue.id,
+                jobId=job.id,
+                sessionId=session["sessionId"],
+            ).get("sessionActions")
+            for session_action in session_actions:
+                definition: dict[str, Any] = session_action["definition"]
+                if (
+                    "envEnter" in definition
+                    or "envExit" in definition
+                    or (
+                        "taskRun" in definition
+                        and succeeded_action_id == session_action["sessionActionId"]
+                    )
+                ):
+                    assert session_action["status"] == "SUCCEEDED"
+                elif (
+                    "taskRun" in definition
+                    and running_action_id == session_action["sessionActionId"]
+                ):
+                    # The action that was running for a long time should now be CANCELED!
+                    assert session_action["status"] == "CANCELED"
+                else:
+                    # Every other action should be in NEVER_ATTEMPTED status
+                    assert session_action["status"] == "NEVER_ATTEMPTED"
 
     def test_worker_always_runs_env_exit_despite_failure(
         self,
@@ -916,14 +1499,13 @@ class TestJobSubmission:
             found_unsuccessful_env_exit: bool = False
             found_successful_env_exit: bool = False
             for session in sessions:
-
                 session_actions: list[dict[str, Any]] = deadline_client.list_session_actions(
                     farmId=job.farm.id,
                     queueId=job.queue.id,
                     jobId=job.id,
                     sessionId=session["sessionId"],
                 ).get("sessionActions")
-                logging.info(f"Session actions: {session_actions}")
+                LOG.info(f"Session actions: {session_actions}")
                 for session_action in session_actions:
                     definition = session_action["definition"]
                     if "envEnter" in definition:
@@ -964,12 +1546,19 @@ class TestJobSubmission:
                         "script": {
                             "actions": {
                                 "onEnter": (
-                                    {"command": "echo", "args": ["Hello!"]}
-                                    if os.environ["OPERATING_SYSTEM"] == "linux"
+                                    {
+                                        "command": "echo",
+                                        "args": [
+                                            "--- STEP: Env 1 enter --- Entering environment_1 PASS: environment_1 entered"
+                                        ],
+                                    }
+                                    if os.environ["OPERATING_SYSTEM"] != "windows"
                                     else {
                                         "command": "powershell",
-                                        "args": ['"Hello"', "+", '"!"'],
-                                    }  # Separating the string is needed to prevent the expected string appearing in output logs more times than expected, as windows worker logs print the command
+                                        "args": [
+                                            "Write-Output '--- STEP: Env 1 enter ---'; Write-Output 'Entering environment_1'; Write-Output 'PASS: environment_1 entered'"
+                                        ],
+                                    }
                                 ),
                             },
                         },
@@ -983,12 +1572,19 @@ class TestJobSubmission:
                         "script": {
                             "actions": {
                                 "onEnter": (
-                                    {"command": "echo", "args": ["Hello!"]}
-                                    if os.environ["OPERATING_SYSTEM"] == "linux"
+                                    {
+                                        "command": "echo",
+                                        "args": [
+                                            "--- STEP: Env 1 enter --- Entering environment_1 PASS: environment_1 entered"
+                                        ],
+                                    }
+                                    if os.environ["OPERATING_SYSTEM"] != "windows"
                                     else {
                                         "command": "powershell",
-                                        "args": ['"Hello"', "+", '"!"'],
-                                    }  # Separating the string is needed to prevent the expected string appearing in output logs more times than expected, as windows worker logs print the command
+                                        "args": [
+                                            "Write-Output '--- STEP: Env 1 enter ---'; Write-Output 'Entering environment_1'; Write-Output 'PASS: environment_1 entered'"
+                                        ],
+                                    }
                                 ),
                             }
                         },
@@ -998,12 +1594,19 @@ class TestJobSubmission:
                         "script": {
                             "actions": {
                                 "onEnter": (
-                                    {"command": "echo", "args": ["Hello!"]}
-                                    if os.environ["OPERATING_SYSTEM"] == "linux"
+                                    {
+                                        "command": "echo",
+                                        "args": [
+                                            "--- STEP: Env 2 enter --- Entering environment_2 PASS: environment_2 entered"
+                                        ],
+                                    }
+                                    if os.environ["OPERATING_SYSTEM"] != "windows"
                                     else {
                                         "command": "powershell",
-                                        "args": ['"Hello"', "+", '"!"'],
-                                    }  # Separating the string is needed to prevent the expected string appearing in output logs more times than expected, as windows worker logs print the command
+                                        "args": [
+                                            "Write-Output '--- STEP: Env 2 enter ---'; Write-Output 'Entering environment_2'; Write-Output 'PASS: environment_2 entered'"
+                                        ],
+                                    }
                                 ),
                             }
                         },
@@ -1013,12 +1616,19 @@ class TestJobSubmission:
                         "script": {
                             "actions": {
                                 "onEnter": (
-                                    {"command": "echo", "args": ["Hello!"]}
-                                    if os.environ["OPERATING_SYSTEM"] == "linux"
+                                    {
+                                        "command": "echo",
+                                        "args": [
+                                            "--- STEP: Env 3 enter --- Entering environment_3 PASS: environment_3 entered"
+                                        ],
+                                    }
+                                    if os.environ["OPERATING_SYSTEM"] != "windows"
                                     else {
                                         "command": "powershell",
-                                        "args": ['"Hello"', "+", '"!"'],
-                                    }  # Separating the string is needed to prevent the expected string appearing in output logs more times than expected, as windows worker logs print the command
+                                        "args": [
+                                            "Write-Output '--- STEP: Env 3 enter ---'; Write-Output 'Entering environment_3'; Write-Output 'PASS: environment_3 entered'"
+                                        ],
+                                    }
                                 ),
                             }
                         },
@@ -1037,6 +1647,7 @@ class TestJobSubmission:
         job_template: dict[str, Any] = {
             "specificationVersion": "jobtemplate-2023-09",
             "name": f"jobWithNumberOfEnvironments-{len(job_environments)}",
+            "description": f"Verifies that {len(job_environments)} environment(s) all enter successfully",
             "steps": [
                 {
                     "name": "Step0",
@@ -1050,9 +1661,21 @@ class TestJobSubmission:
                     },
                     "script": {
                         "actions": {
-                            "onRun": {
-                                "command": "whoami",
-                            },
+                            "onRun": (
+                                {
+                                    "command": "echo",
+                                    "args": [
+                                        "--- STEP: Task run --- Running task PASS: Task completed"
+                                    ],
+                                }
+                                if os.environ["OPERATING_SYSTEM"] != "windows"
+                                else {
+                                    "command": "powershell",
+                                    "args": [
+                                        "Write-Output '--- STEP: Task run ---'; Write-Output 'Running task'; Write-Output 'PASS: Task completed'"
+                                    ],
+                                }
+                            ),
                         },
                     },
                 },
@@ -1072,29 +1695,9 @@ class TestJobSubmission:
 
         job.wait_until_complete(client=deadline_client)
 
-        assert job.task_run_status == TaskStatus.SUCCEEDED
-
-        logs_client = boto3.client(
-            "logs",
-            config=botocore.config.Config(retries={"max_attempts": 10, "mode": "adaptive"}),
+        assert job.task_run_status == TaskStatus.SUCCEEDED, job_failure_message(
+            job, deadline_client, deadline_resources.queue_a, deadline_resources
         )
-
-        if len(job_environments) == 1:
-            job.assert_single_task_log_contains(
-                deadline_client=deadline_client,
-                logs_client=logs_client,
-                # pass in alldot pattern
-                expected_pattern=r"Hello!",
-                assert_fail_msg="Expected Number of Hello statements not found in job logs.",
-            )
-
-        if len(job_environments) == 3:
-            job.assert_single_task_log_contains(
-                deadline_client=deadline_client,
-                logs_client=logs_client,
-                expected_pattern=re.compile(r"Hello!.*Hello!.*Hello!", re.DOTALL),
-                assert_fail_msg="Expected Number of Hello statements not found in job logs.",
-            )
 
     def test_worker_streams_logs_to_cloudwatch(
         self,
@@ -1102,7 +1705,6 @@ class TestJobSubmission:
         deadline_client: DeadlineClient,
         session_worker: EC2InstanceWorker,
     ) -> None:
-
         job_start_time_seconds: float = time.time()
         job: Job = Job.submit(
             client=deadline_client,
@@ -1127,7 +1729,7 @@ class TestJobSubmission:
                             "actions": {
                                 "onRun": (
                                     {"command": "echo", "args": ["HelloWorld"]}
-                                    if os.environ["OPERATING_SYSTEM"] == "linux"
+                                    if os.environ["OPERATING_SYSTEM"] != "windows"
                                     else {
                                         "command": "powershell",
                                         "args": ['"Hello"', "+", '"World"'],
@@ -1178,561 +1780,12 @@ class TestJobSubmission:
 
         assert check_for_worker_log_event(), f"Could not find a worker log for {worker_id}"
 
-    @pytest.mark.parametrize(
-        "append_string_script",
-        [
-            (
-                "#!/usr/bin/env bash\n\n  echo -n $(cat {{Param.DataDir}}/files/test_input_file){{Param.StringToAppend}} > {{Param.DataDir}}/output_file\n"
-                if os.environ["OPERATING_SYSTEM"] == "linux"
-                else '''set /p input=<"{{Param.DataDir}}\\files\\test_input_file"\n powershell -Command "echo ($env:input+\'{{Param.StringToAppend}}\') | Out-File -encoding utf8 {{Param.DataDir}}\\output_file -NoNewLine"'''
-            )
-        ],
-    )
-    def test_worker_uses_job_attachment_configuration(
-        self,
-        deadline_resources: DeadlineResources,
-        deadline_client: DeadlineClient,
-        session_worker: EC2InstanceWorker,
-        append_string_script: str,
-    ) -> None:
-        # Verify that the worker uses the correct job attachment configuration, and writes the output to the correct location
-
-        test_run_uuid: str = str(uuid.uuid4())
-
-        job_bundle_path: str = os.path.join(
-            os.path.dirname(__file__),
-            "job_attachment_bundle",
-        )
-        job_parameters: List[Dict[str, str]] = [
-            {"name": "StringToAppend", "value": test_run_uuid},
-            {"name": "DataDir", "value": job_bundle_path},
-        ]
-        try:
-            with open(os.path.join(job_bundle_path, "template.json"), "w+") as template_file:
-                template_file.write(
-                    json.dumps(
-                        {
-                            "specificationVersion": "jobtemplate-2023-09",
-                            "name": "AppendStringJob",
-                            "parameterDefinitions": [
-                                {
-                                    "name": "DataDir",
-                                    "type": "PATH",
-                                    "dataFlow": "INOUT",
-                                },
-                                {"name": "StringToAppend", "type": "STRING"},
-                            ],
-                            "steps": [
-                                {
-                                    "name": "AppendString",
-                                    "hostRequirements": {
-                                        "attributes": [
-                                            {
-                                                "name": "attr.worker.os.family",
-                                                "allOf": [os.environ["OPERATING_SYSTEM"]],
-                                            }
-                                        ]
-                                    },
-                                    "script": {
-                                        "actions": {
-                                            "onRun": {"command": "{{ Task.File.runScript }}"}
-                                        },
-                                        "embeddedFiles": [
-                                            {
-                                                "name": "runScript",
-                                                "type": "TEXT",
-                                                "runnable": True,
-                                                "data": append_string_script,
-                                                **(
-                                                    {"filename": "stringappendscript.bat"}
-                                                    if os.environ["OPERATING_SYSTEM"] == "windows"
-                                                    else {}
-                                                ),
-                                            }
-                                        ],
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                )
-
-            config = configparser.ConfigParser()
-
-            set_setting("defaults.farm_id", deadline_resources.farm.id, config)
-            set_setting("defaults.queue_id", deadline_resources.queue_a.id, config)
-
-            job_id: Optional[str] = api.create_job_from_job_bundle(
-                job_bundle_path,
-                job_parameters,
-                priority=99,
-                config=config,
-                queue_parameter_definitions=[],
-            )
-            assert job_id is not None
-        finally:
-            # Clean up the template file
-            os.remove(os.path.join(job_bundle_path, "template.json"))
-
-        job_details: dict[str, Any] = Job.get_job_details(
-            client=deadline_client,
-            farm=deadline_resources.farm,
-            queue=deadline_resources.queue_a,
-            job_id=job_id,
-        )
-        job: Job = Job(
-            farm=deadline_resources.farm,
-            queue=deadline_resources.queue_a,
-            template={},
-            **job_details,
-        )
-
-        output_path: dict[str, list[str]] = wait_for_job_output(
-            job=job, deadline_client=deadline_client, deadline_resources=deadline_resources
-        )
-
-        try:
-            with (
-                open(os.path.join(job_bundle_path, "files", "test_input_file"), "r") as input_file,
-                open(
-                    os.path.join(
-                        list(output_path.keys())[0],
-                        "output_file",
-                    ),
-                    "r",
-                    encoding="utf-8-sig",
-                ) as output_file,
-            ):
-                input_file_content: str = input_file.read()
-                output_file_content = output_file.read()
-
-                # Verify that the output file content is the input file content plus the uuid we appended in the job
-                assert output_file_content == (input_file_content + test_run_uuid)
-        finally:
-            os.remove(os.path.join(list(output_path.keys())[0], "output_file"))
-
-    def test_worker_job_attachments_no_outputs_does_not_fail_job(
-        self,
-        deadline_resources: DeadlineResources,
-        deadline_client: DeadlineClient,
-        session_worker: EC2InstanceWorker,
-    ) -> None:
-        # Tests that if a job has no job output files in the output directory, the job does not fail. This tests prevents regressions in the output code
-
-        job_bundle_path: str = os.path.join(
-            os.path.dirname(__file__),
-            "job_attachment_bundle",
-        )
-
-        try:
-            with (
-                open(os.path.join(job_bundle_path, "template.json"), "w+") as template_file,
-                tempfile.TemporaryDirectory() as temporary_output_directory,
-            ):
-
-                job_parameters: List[Dict[str, str]] = [
-                    {
-                        "name": "OutputFilePath",
-                        "value": temporary_output_directory,
-                    },
-                ]
-
-                template_file.write(
-                    json.dumps(
-                        {
-                            "specificationVersion": "jobtemplate-2023-09",
-                            "name": "NoOutputJob",
-                            "parameterDefinitions": [
-                                {
-                                    "name": "OutputFilePath",
-                                    "type": "PATH",
-                                    "objectType": "DIRECTORY",
-                                    "dataFlow": "OUT",
-                                },
-                            ],
-                            "steps": [
-                                {
-                                    "name": "MainStep",
-                                    "hostRequirements": {
-                                        "attributes": [
-                                            {
-                                                "name": "attr.worker.os.family",
-                                                "allOf": [os.environ["OPERATING_SYSTEM"]],
-                                            }
-                                        ]
-                                    },
-                                    "script": {
-                                        "actions": {"onRun": {"command": "whoami"}},
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                )
-                config = configparser.ConfigParser()
-
-            set_setting("defaults.farm_id", deadline_resources.farm.id, config)
-            set_setting("defaults.queue_id", deadline_resources.queue_a.id, config)
-            job_id: Optional[str] = api.create_job_from_job_bundle(
-                job_bundle_path,
-                job_parameters,
-                priority=99,
-                config=config,
-                queue_parameter_definitions=[],
-                require_paths_exist=True,
-            )
-            assert job_id is not None
-        finally:
-            # Clean up the template file
-            os.remove(os.path.join(job_bundle_path, "template.json"))
-
-        job_details = Job.get_job_details(
-            client=deadline_client,
-            farm=deadline_resources.farm,
-            queue=deadline_resources.queue_a,
-            job_id=job_id,
-        )
-        job = Job(
-            farm=deadline_resources.farm,
-            queue=deadline_resources.queue_a,
-            template={},
-            **job_details,
-        )
-        job.wait_until_complete(client=deadline_client)
-
-        assert job.task_run_status == TaskStatus.SUCCEEDED
-
-    @pytest.mark.skip(reason="Queue role permissions are failing the test during E2E test runs")
-    def test_worker_fails_job_attachment_sync_when_non_valid_queue_role(
-        self,
-        deadline_resources: DeadlineResources,
-        session_worker: EC2InstanceWorker,
-        deadline_client: DeadlineClient,
-    ) -> None:
-        # Test that when submitting a job with job attachments to a queue with a role that cannot read the S3 bucket, the worker will fail the job attachments sync
-
-        job_bundle_path: str = os.path.join(
-            os.path.dirname(__file__),
-            "job_attachment_bundle",
-        )
-        job_parameters: List[Dict[str, str]] = [
-            {"name": "DataDir", "value": job_bundle_path},
-        ]
-        append_string_script = (
-            "#!/usr/bin/env bash\n\n  echo -n $(cat {{Param.DataDir}}/files/test_input_file)hi > {{Param.DataDir}}/output_file\n"
-            if os.environ["OPERATING_SYSTEM"] == "linux"
-            else '''set /p input=<"{{Param.DataDir}}\\files\\test_input_file"\n powershell -Command "echo ($env:input+\'hi\') | Out-File -encoding utf8 {{Param.DataDir}}\\output_file -NoNewLine"'''
-        )
-
-        try:
-            with open(os.path.join(job_bundle_path, "template.json"), "w+") as template_file:
-                template_file.write(
-                    json.dumps(
-                        {
-                            "specificationVersion": "jobtemplate-2023-09",
-                            "name": "JobAttachmentToNonValidRoleQueue",
-                            "parameterDefinitions": [
-                                {
-                                    "name": "DataDir",
-                                    "type": "PATH",
-                                    "dataFlow": "INOUT",
-                                },
-                            ],
-                            "steps": [
-                                {
-                                    "name": "Step0",
-                                    "hostRequirements": {
-                                        "attributes": [
-                                            {
-                                                "name": "attr.worker.os.family",
-                                                "allOf": [os.environ["OPERATING_SYSTEM"]],
-                                            }
-                                        ]
-                                    },
-                                    "script": {
-                                        "actions": {
-                                            "onRun": {"command": "{{ Task.File.runScript }}"}
-                                        },
-                                        "embeddedFiles": [
-                                            {
-                                                "name": "runScript",
-                                                "type": "TEXT",
-                                                "runnable": True,
-                                                "data": append_string_script,
-                                                **(
-                                                    {"filename": "stringappendscript.bat"}
-                                                    if os.environ["OPERATING_SYSTEM"] == "windows"
-                                                    else {}
-                                                ),
-                                            }
-                                        ],
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                )
-
-            config = configparser.ConfigParser()
-
-            set_setting("defaults.farm_id", deadline_resources.farm.id, config)
-            set_setting("defaults.queue_id", deadline_resources.non_valid_role_queue.id, config)
-
-            job_id: Optional[str] = api.create_job_from_job_bundle(
-                job_bundle_path,
-                job_parameters,
-                priority=99,
-                config=config,
-                queue_parameter_definitions=[],
-            )
-            assert job_id is not None
-        finally:
-            # Clean up the template file
-            os.remove(os.path.join(job_bundle_path, "template.json"))
-
-        job_details = Job.get_job_details(
-            client=deadline_client,
-            farm=deadline_resources.farm,
-            queue=deadline_resources.non_valid_role_queue,
-            job_id=job_id,
-        )
-        job = Job(
-            farm=deadline_resources.farm,
-            queue=deadline_resources.non_valid_role_queue,
-            template={},
-            **job_details,
-        )
-
-        @backoff.on_predicate(
-            wait_gen=backoff.constant,
-            max_time=120,
-            interval=10,
-        )
-        def sync_input_job_attachments_failed(current_job: Job) -> bool:
-            sessions: list[dict[str, Any]] = deadline_client.list_sessions(
-                farmId=current_job.farm.id, queueId=current_job.queue.id, jobId=current_job.id
-            ).get("sessions")
-
-            if sessions:
-                session_actions = deadline_client.list_session_actions(
-                    farmId=job.farm.id,
-                    queueId=job.queue.id,
-                    jobId=job.id,
-                    sessionId=sessions[0]["sessionId"],
-                ).get("sessionActions")
-
-                for session_action in session_actions:
-                    if "syncInputJobAttachments" in session_action["definition"]:
-                        return session_action["status"] == "FAILED"
-            return False
-
-        # Check that the syncInputJobAttachments action failed, since the queue does not have a queue role
-
-        assert sync_input_job_attachments_failed(job)
-
-        return
-
-    @pytest.mark.parametrize(
-        "hash_string_script",
-        [
-            (
-                "#!/usr/bin/env bash\n\n"
-                "folder_path={{Param.DataDir}}/files\n"
-                'combined_contents=""\n'
-                'for file in "$folder_path"/*; do\n'
-                '   if [ -f "$file" ]; then\n'
-                '   combined_contents+="$(cat "$file" | tr -d \'\\n\')"\n'
-                "   fi\n"
-                "done\n"
-                "sha256_hash=$(echo -n \"$combined_contents\" | sha256sum | awk '{ print $1 }')\n"
-                'echo -n "$sha256_hash" > {{Param.DataDir}}/output_file.txt'
-                if os.environ["OPERATING_SYSTEM"] == "linux"
-                else '$InputFolder = "{{Param.DataDir}}\\files"\n'
-                '$OutputFile = "{{Param.DataDir}}\\output_file.txt"\n'
-                '$combinedContent = ""\n'
-                "$files = Get-ChildItem -Path $InputFolder -File\n"
-                "foreach ($file in $files) {\n"
-                "   $combinedContent += [IO.File]::ReadAllText($file.FullName)\n"
-                "}\n"
-                "$sha256 = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($combinedContent))\n"
-                '$hashString = [System.BitConverter]::ToString($sha256).Replace("-", "").ToLower()\n'
-                "Set-Content -Path $OutputFile -Value $hashString -NoNewLine"
-            )
-        ],
-    )
-    def test_worker_uses_job_attachment_sync(
-        self,
-        deadline_resources: DeadlineResources,
-        deadline_client: DeadlineClient,
-        session_worker: EC2InstanceWorker,
-        hash_string_script: str,
-        tmp_path: pathlib.Path,
-    ) -> None:
-        # Verify that the worker sync job attachment correctly and report the progress correctly as well
-
-        job_bundle_path: str = os.path.join(
-            tmp_path,
-            "job_attachment_bundle_large",
-        )
-        file_path: str = os.path.join(job_bundle_path, "files")
-
-        os.mkdir(job_bundle_path)
-        os.mkdir(file_path)
-
-        # Create 2500 very small files to transfer
-        for i in range(2500):
-            file_name: str = os.path.join(file_path, f"file_{i+1}.txt")
-            with open(file_name, "w") as file_to_write:
-                file_to_write.write(str(i))
-
-        # Calculate the hash of all the files content combine
-        combined_string: str = ""
-        for file_name in sorted(os.listdir(file_path)):
-            file: str = os.path.join(file_path, file_name)
-            # Open the file and read its contents
-            with open(file, "r") as file_string:
-                file_contents: str = file_string.read()
-
-            # Concatenate the file contents to the combined string
-            combined_string += file_contents
-
-        combined_hash: str = hashlib.sha256(combined_string.encode()).hexdigest()
-
-        # JA template to get all files and compute the hash
-        job_parameters: List[Dict[str, str]] = [
-            {"name": "DataDir", "value": job_bundle_path},
-        ]
-        with open(os.path.join(job_bundle_path, "template.json"), "w+") as template_file:
-            template_file.write(
-                json.dumps(
-                    {
-                        "specificationVersion": "jobtemplate-2023-09",
-                        "name": "AssetsSync",
-                        "parameterDefinitions": [
-                            {
-                                "name": "DataDir",
-                                "type": "PATH",
-                                "dataFlow": "INOUT",
-                            },
-                        ],
-                        "steps": [
-                            {
-                                "name": "HashString",
-                                "hostRequirements": {
-                                    "attributes": [
-                                        {
-                                            "name": "attr.worker.os.family",
-                                            "allOf": [os.environ["OPERATING_SYSTEM"]],
-                                        }
-                                    ]
-                                },
-                                "script": {
-                                    "actions": {
-                                        "onRun": (
-                                            {"command": "{{ Task.File.runScript }}"}
-                                            if os.environ["OPERATING_SYSTEM"] == "linux"
-                                            else {
-                                                "command": "powershell",
-                                                "args": ["{{ Task.File.runScript }}"],
-                                            }
-                                        ),
-                                    },
-                                    "embeddedFiles": [
-                                        {
-                                            "name": "runScript",
-                                            "type": "TEXT",
-                                            "runnable": True,
-                                            "data": hash_string_script,
-                                            **(
-                                                {"filename": "hashscript.ps1"}
-                                                if os.environ["OPERATING_SYSTEM"] == "windows"
-                                                else {}
-                                            ),
-                                        }
-                                    ],
-                                },
-                            }
-                        ],
-                    }
-                )
-            )
-
-        config = configparser.ConfigParser()
-
-        set_setting("defaults.farm_id", deadline_resources.farm.id, config)
-        set_setting("defaults.queue_id", deadline_resources.queue_a.id, config)
-
-        job_id: Optional[str] = api.create_job_from_job_bundle(
-            job_bundle_path,
-            job_parameters,
-            priority=99,
-            max_retries_per_task=0,
-            config=config,
-            queue_parameter_definitions=[],
-        )
-        assert job_id is not None
-
-        job_details = Job.get_job_details(
-            client=deadline_client,
-            farm=deadline_resources.farm,
-            queue=deadline_resources.queue_a,
-            job_id=job_id,
-        )
-        job = Job(
-            farm=deadline_resources.farm,
-            queue=deadline_resources.queue_a,
-            template={},
-            **job_details,
-        )
-
-        # Query the session to check for progress percentage
-        complete_percentage: float = 0
-
-        @backoff.on_predicate(
-            wait_gen=backoff.constant,
-            max_time=120,
-            interval=2,
-        )
-        def check_percentage(complete_percentage) -> bool:
-            sessions = deadline_client.list_sessions(
-                farmId=job.farm.id, queueId=job.queue.id, jobId=job.id
-            ).get("sessions")
-
-            if sessions:
-                session_actions = deadline_client.list_session_actions(
-                    farmId=job.farm.id,
-                    queueId=job.queue.id,
-                    jobId=job.id,
-                    sessionId=sessions[0]["sessionId"],
-                ).get("sessionActions")
-
-                for session_action in session_actions:
-                    if "syncInputJobAttachments" in session_action["definition"]:
-                        assert complete_percentage <= session_action["progressPercent"]
-                        complete_percentage = session_action["progressPercent"]
-                        return complete_percentage == 100
-
-            return False
-
-        assert check_percentage(complete_percentage)
-
-        output_path: dict[str, list[str]] = wait_for_job_output(
-            job=job, deadline_client=deadline_client, deadline_resources=deadline_resources
-        )
-        with (
-            open(os.path.join(list(output_path.keys())[0], "output_file.txt"), "r") as output_file,
-        ):
-            output_file_content: str = output_file.read()
-            # Verify that the hash is the same
-            assert output_file_content == combined_hash
-
     def test_worker_reports_task_progress_and_status_message(
         self,
         deadline_resources: DeadlineResources,
         deadline_client: DeadlineClient,
         session_worker: EC2InstanceWorker,
     ) -> None:
-
         # Make sure that worker reports task progress, as well as the status message
 
         # Submit a job with a task that sleeps for 60 seconds , which is more than the UpdateWorkerSchedule interval of 30 seconds
@@ -1751,7 +1804,7 @@ class TestJobSubmission:
                 sleep 6
             done
             """
-            if os.environ["OPERATING_SYSTEM"] == "linux"
+            if os.environ["OPERATING_SYSTEM"] != "windows"
             else f"""
             $percent = 0
             while ($percent -le 100) {{
@@ -1775,12 +1828,12 @@ class TestJobSubmission:
             max_time=120,
             interval=2,
         )
-        def is_job_started() -> bool:
+        def is_job_created() -> bool:
             job.refresh_job_info(client=deadline_client)
             LOG.info(f"Waiting for job {job.id} to be created")
             return job.lifecycle_status != "CREATE_IN_PROGRESS"
 
-        assert is_job_started()
+        assert is_job_created()
 
         @backoff.on_predicate(
             wait_gen=backoff.constant,
@@ -1846,7 +1899,9 @@ class TestJobSubmission:
 
         job.wait_until_complete(client=deadline_client)
 
-        assert job.task_run_status == TaskStatus.SUCCEEDED
+        assert job.task_run_status == TaskStatus.SUCCEEDED, job_failure_message(
+            job, deadline_client, deadline_resources.queue_a, deadline_resources
+        )
 
     def test_worker_enters_stopping_state_while_draining(
         self,
@@ -1858,13 +1913,12 @@ class TestJobSubmission:
             #!/usr/bin/env bash
             sleep 600
             """
-            if os.environ["OPERATING_SYSTEM"] == "linux"
+            if os.environ["OPERATING_SYSTEM"] != "windows"
             else """
             Start-Sleep -Seconds 600
             """
         ),
     ):
-
         job: Job = submit_custom_job(
             job_name="10 Minutes Sleep Job",
             deadline_client=deadline_client,
@@ -1873,8 +1927,15 @@ class TestJobSubmission:
             run_script=sleep_script,
         )
 
+        # Stopping the service sends the agent a SIGTERM (or the Windows service stop
+        # equivalent), which is what triggers the drain. The command differs by service
+        # manager: systemd on Linux, launchd on macOS, and the Windows service manager.
         if os.environ["OPERATING_SYSTEM"] == "linux":
             cmd_result = function_worker.send_command("sudo systemctl stop deadline-worker")
+        elif os.environ["OPERATING_SYSTEM"] == "macos":
+            cmd_result = function_worker.send_command(
+                f"sudo launchctl bootout system/{MACOS_LAUNCHD_LABEL}"
+            )
         else:
             cmd_result = function_worker.send_command("sc.exe stop DeadlineWorker")
 

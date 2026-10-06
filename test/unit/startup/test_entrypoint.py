@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 """Tests for the Worker Agent entrypoint"""
+
 from __future__ import annotations
 
 import logging
@@ -15,6 +16,7 @@ from tempfile import TemporaryDirectory
 import pytest
 
 from deadline_worker_agent.api_models import WorkerStatus
+from deadline_worker_agent.config import Configuration, ConfigurationError
 from deadline_worker_agent.errors import ServiceShutdown
 from deadline_worker_agent.log_sync.loggers import ROOT_LOGGER
 from deadline_worker_agent.startup import entrypoint as entrypoint_mod
@@ -23,9 +25,8 @@ from deadline_worker_agent.startup.bootstrap import (
     WorkerBootstrap,
     WorkerPersistenceInfo,
 )
-from deadline_worker_agent.aws.deadline import WorkerLogConfig
-from deadline_worker_agent.startup.config import Configuration, ConfigurationError
-from deadline_worker_agent.log_messages import WorkerLogEvent
+from deadline_worker_agent.aws.deadline import WorkerHostConfiguration, WorkerLogConfig
+from deadline_worker_agent.log_messages import WorkerHostConfigurationLogEvent, WorkerLogEvent
 
 entrypoint = entrypoint_mod.entrypoint
 
@@ -38,6 +39,16 @@ def cloudwatch_log_group() -> str:
 @pytest.fixture
 def cloudwatch_log_stream() -> str:
     return "cloudwatch_log_stream"
+
+
+@pytest.fixture
+def host_configuration_script() -> str:
+    return "echo Hello"
+
+
+@pytest.fixture
+def host_configuration_script_timeout() -> int:
+    return 456
 
 
 @pytest.fixture
@@ -57,6 +68,16 @@ def worker_log_config(
     return WorkerLogConfig(
         cloudwatch_log_group=cloudwatch_log_group,
         cloudwatch_log_stream=cloudwatch_log_stream,
+    )
+
+
+@pytest.fixture
+def worker_host_config(
+    host_configuration_script: str, host_configuration_script_timeout: int
+) -> WorkerHostConfiguration:
+    return WorkerHostConfiguration(
+        script_body=host_configuration_script,
+        script_timeout_seconds=host_configuration_script_timeout,
     )
 
 
@@ -87,6 +108,7 @@ def bootstrap_worker_mock(
     worker_info: WorkerPersistenceInfo,
     mock_boto_session: MagicMock,
     worker_log_config: WorkerLogConfig,
+    worker_host_config: WorkerHostConfiguration,
 ) -> Generator[MagicMock, None, None]:
     with patch.object(
         entrypoint_mod,
@@ -95,6 +117,7 @@ def bootstrap_worker_mock(
             worker_info=worker_info,
             session=mock_boto_session,
             log_config=worker_log_config,
+            host_config=worker_host_config,
         ),
     ) as bootstrap_worker_mock:
         yield bootstrap_worker_mock
@@ -174,6 +197,14 @@ def block_rich_import() -> Generator[None, None, None]:
 def block_telemetry_client() -> Generator[MagicMock, None, None]:
     with patch.object(entrypoint_mod, "record_worker_start_telemetry_event") as telem_mock:
         yield telem_mock
+
+
+@pytest.fixture(autouse=True)
+def mock_fleet_host_configuration_runner() -> Generator[MagicMock, None, None]:
+    """This mocks the HostConfigurationScriptRunner so We can test the entry point script run behavior."""
+    with patch.object(entrypoint_mod, "HostConfigurationScriptRunner") as mock_obj:
+        mock_obj.return_value.run.return_value = 0
+        yield mock_obj
 
 
 def test_calls_worker_run(
@@ -498,6 +529,7 @@ def test_agent_self_initiated_shutdown(
     (
         pytest.param("win32", ["shutdown", "-s"], id="windows"),
         pytest.param("linux", ["sudo", "shutdown", "now"], id="linux"),
+        pytest.param("darwin", ["sudo", "shutdown", "-h", "now"], id="macOS"),
     ),
 )
 @patch.object(entrypoint_mod._logger, "info")
@@ -536,6 +568,7 @@ def test_host_shutdown(
     (
         pytest.param("win32", ["shutdown", "-s"], id="windows"),
         pytest.param("linux", ["sudo", "shutdown", "now"], id="linux"),
+        pytest.param("darwin", ["sudo", "shutdown", "-h", "now"], id="macOS"),
     ),
 )
 @patch.object(entrypoint_mod, "_logger")
@@ -586,6 +619,7 @@ def test_host_shutdown_failure(
     (
         pytest.param("win32", ["shutdown", "-s"], id="windows"),
         pytest.param("linux", ["sudo", "shutdown", "now"], id="linux"),
+        pytest.param("darwin", ["sudo", "shutdown", "-h", "now"], id="macOS"),
     ),
 )
 @patch.object(entrypoint_mod._logger, "debug")
@@ -648,23 +682,24 @@ def test_passes_worker_logs_dir(
         entrypoint()
 
     # THEN
-    worker_mock.assert_called_once_with(
-        farm_id=ANY,
-        fleet_id=ANY,
-        worker_id=ANY,
-        deadline_client=ANY,
-        s3_client=ANY,
-        logs_client=ANY,
-        boto_session=ANY,
-        job_run_as_user_override=ANY,
-        cleanup_session_user_processes=ANY,
-        worker_persistence_dir=ANY,
-        worker_logs_dir=tmp_path,
-        host_metrics_logging=ANY,
-        host_metrics_logging_interval_seconds=ANY,
-        retain_session_dir=ANY,
-        stop=ANY,
-    )
+    worker_mock.assert_called_once()
+    assert worker_mock.call_args.kwargs["worker_logs_dir"] == tmp_path
+
+
+def test_passes_session_root_dir(
+    configuration: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Assert that the Worker is passed the session_root_dir from the configuration"""
+    # GIVEN
+    configuration.session_root_dir = tmp_path
+    with patch.object(entrypoint_mod, "Worker") as worker_mock:
+        # WHEN
+        entrypoint()
+
+    # THEN
+    worker_mock.assert_called_once()
+    assert worker_mock.call_args.kwargs["session_root_dir"] == tmp_path
 
 
 @patch.object(entrypoint_mod, "_logger")
@@ -735,3 +770,145 @@ class TestCloudWatchLogStreaming:
         )
         context_mgr_enter.assert_called_once_with()
         context_mgr_exit.assert_called_once()
+
+
+@patch.object(entrypoint_mod, "record_uncaught_exception_telemetry_event")
+@patch.object(entrypoint_mod.sys, "exit")
+def test_host_config_already_run_before(
+    sys_exit_mock: MagicMock,
+    telemetry_mock: MagicMock,
+    bootstrap_worker_mock: MagicMock,
+    mock_fleet_host_configuration_runner: MagicMock,
+    worker_info: WorkerPersistenceInfo,
+) -> None:
+    # Turn ON the feature flag for this test.
+    # Given
+    worker_info.host_configuration_succeeded = True
+
+    with patch.object(entrypoint_mod, "_logger") as logger:
+        # WHEN
+        entrypoint()
+
+    # Then
+    mock_fleet_host_configuration_runner.assert_not_called()
+
+    expected = "Host Configuration has been setup before. Not running config scripts."
+
+    all_args = [
+        arg.msg
+        for args, kwargs in logger.info.call_args_list
+        for arg in list(args) + list(kwargs.values())
+        if isinstance(arg, WorkerHostConfigurationLogEvent)
+    ]
+    assert len(all_args) > 0
+    assert expected in all_args
+
+
+@pytest.mark.parametrize(
+    ("has_host_config", "exit_code", "can_shutdown"),
+    (
+        pytest.param(True, 0, True, id="Has HostConfig, run success, can shutdown"),
+        pytest.param(True, 1, True, id="Has HostConfig, run failed, can shutdown"),
+        pytest.param(True, 1, False, id="Has HostConfig, run failed, cannot shutdown"),
+        pytest.param(False, 1, True, id="No Host Config"),
+    ),
+)
+@patch.object(entrypoint_mod, "_repeatedly_attempt_host_shutdown")
+@patch.object(entrypoint_mod, "record_uncaught_exception_telemetry_event")
+@patch.object(entrypoint_mod.sys, "exit")
+@patch.object(entrypoint_mod, "sleep")
+def test_fleet_host_config(
+    sleep_mock: MagicMock,
+    sys_exit_mock: MagicMock,
+    telemetry_mock: MagicMock,
+    mock_repeat_attempt_host_shutdown: MagicMock,
+    has_host_config: bool,
+    exit_code: int,
+    can_shutdown: bool,
+    bootstrap_worker_mock: MagicMock,
+    mock_fleet_host_configuration_runner: MagicMock,
+    worker_info: WorkerPersistenceInfo,
+    configuration_load: MagicMock,
+    mock_host_shutdown: MagicMock,
+    worker_id: str,
+) -> None:
+    """Tests that exceptions raised by Worker.run() are logged and the program exits with a non-zero exit code"""
+
+    # Turn ON the feature flag for this test.
+    # GIVEN
+    if has_host_config:
+        # Did the script run successfully.
+        mock_fleet_host_configuration_runner.return_value.run.return_value = exit_code
+    else:
+        # No script to run.
+        bootstrap_worker_mock.return_value.host_config = None
+
+    # Can the worker agent shutdown on script failure.
+    if can_shutdown:
+        configuration_load.return_value.no_shutdown = False
+        mock_repeat_attempt_host_shutdown.side_effect = [True, False]
+    else:
+        mock_repeat_attempt_host_shutdown.side_effect = [False]
+        configuration_load.return_value.no_shutdown = True
+
+    with (
+        patch.object(entrypoint_mod, "_logger") as logger,
+        patch.object(entrypoint_mod, "update_worker") as update_worker_mock,
+    ):
+        # WHEN
+        entrypoint()
+
+    # THEN
+    if not has_host_config:
+        mock_fleet_host_configuration_runner.assert_not_called()
+        assert not worker_info.host_configuration_succeeded
+    elif exit_code == 0:
+        # Make sure we save the host configuration marker.
+        assert worker_info.host_configuration_succeeded
+
+        expected = "Worker Agent host configuration succeeded. Starting worker session loop."
+
+        all_args = [
+            arg.msg
+            for args, kwargs in logger.info.call_args_list
+            for arg in list(args) + list(kwargs.values())
+            if isinstance(arg, WorkerHostConfigurationLogEvent)
+        ]
+        assert len(all_args) > 0
+        assert expected in all_args
+
+    else:
+        # Make sure we save the host configuration marker.
+        assert not worker_info.host_configuration_succeeded
+
+        # Check logs have been added.
+        expected = (
+            "Worker Agent host configuration failed with exit code 1. Cannot run jobs, exiting."
+        )
+
+        all_args = [
+            arg.msg
+            for args, kwargs in logger.critical.call_args_list
+            for arg in list(args) + list(kwargs.values())
+            if isinstance(arg, WorkerHostConfigurationLogEvent)
+        ]
+        assert len(all_args) > 0
+        assert expected in all_args
+
+        # Make sure we called to the backend to STOPPED.
+        update_worker_mock.assert_any_call(
+            deadline_client=ANY,
+            farm_id=configuration_load.return_value.farm_id,
+            fleet_id=configuration_load.return_value.fleet_id,
+            worker_id=worker_id,
+            status=WorkerStatus.STOPPED,
+        )
+        # If it can shutdown, assert that we attempted to call the shutdown method.
+        if can_shutdown:
+            mock_host_shutdown.assert_called_once()
+            sleep_mock.assert_called_once()
+        # Otherwise, worker agent exits.
+        else:
+            sys_exit_mock.assert_called_once_with(1)
+            mock_host_shutdown.assert_not_called()
+            sleep_mock.assert_not_called()

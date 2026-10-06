@@ -1,5 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
+from __future__ import annotations
+
 from typing import Any, cast
 import pytest
 
@@ -84,6 +86,57 @@ def job_details_only_run_as_worker_agent_user() -> JobDetails:
                 },
             },
             id="valid parameters",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "boolParam": {"bool": True},
+                    "rangeExprParam": {"rangeExpr": "1-10:2"},
+                    "stringListParam": {"stringList": ["a", "b"]},
+                    "pathListParam": {"pathList": ["/path/a", "/path/b"]},
+                    "intListParam": {"intList": ["1", "2"]},
+                    "floatListParam": {"floatList": ["1.1", "2.2"]},
+                    "boolListParam": {"boolList": [True, False]},
+                    "intListListParam": {"intListList": [["1", "2"], ["3"]]},
+                },
+            },
+            id="valid expr parameters",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"bool": "true"},
+                },
+            },
+            id="valid parameters - bool value as a string.",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"bool": True},
+                },
+            },
+            id="valid parameters - bool value as a native boolean.",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"boolList": ["true", "false"]},
+                },
+            },
+            id="valid parameters - boolList elements as strings.",
         ),
         pytest.param(
             {
@@ -231,6 +284,38 @@ def job_details_only_run_as_worker_agent_user() -> JobDetails:
 def test_input_validation_success(data: dict[str, Any]) -> None:
     """Test that validate_entity_data() can successfully handle valid input data."""
     JobDetails.validate_entity_data(entity_data=data, job_user_override=None)
+
+
+@pytest.mark.parametrize(
+    "wire_value, expected",
+    [
+        pytest.param("true", True, id="string-true"),
+        pytest.param("false", False, id="string-false"),
+        pytest.param(True, True, id="native-true"),
+        pytest.param(False, False, id="native-false"),
+    ],
+)
+def test_string_bool_survives_validation_and_decodes(
+    wire_value: str | bool, expected: bool
+) -> None:
+    """A string-encoded (or native) boolean parameter must pass validate_entity_data()
+    and then decode to a native Python bool through from_boto(), exercising both layers."""
+    # GIVEN
+    data: dict[str, Any] = {
+        "jobId": "job-0000",
+        "logGroupName": "/aws/deadline/queue-0000",
+        "schemaVersion": "jobtemplate-2023-09",
+        "parameters": {"param1": {"bool": wire_value}},
+    }
+
+    # WHEN
+    validated = JobDetails.validate_entity_data(entity_data=data, job_user_override=None)
+    job_details = JobDetails.from_boto(validated)
+
+    # THEN
+    param_value = job_details.parameters["param1"]
+    assert param_value.value == expected
+    assert isinstance(param_value.value, bool)
 
 
 @pytest.mark.parametrize(
@@ -390,6 +475,114 @@ def test_convert_job_user_from_boto(data: JobDetailsData, expected: JobDetails, 
                 },
             },
             id="nonvalid parameters - a type key is unknown type.",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"bool": 1},
+                },
+                "jobRunAsUser": {
+                    "posix": {
+                        "user": "abc",
+                        "group": "abc",
+                    },
+                    "runAs": "QUEUE_CONFIGURED_USER",
+                },
+            },
+            id="nonvalid parameters - bool value is an int.",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"bool": None},
+                },
+                "jobRunAsUser": {
+                    "posix": {
+                        "user": "abc",
+                        "group": "abc",
+                    },
+                    "runAs": "QUEUE_CONFIGURED_USER",
+                },
+            },
+            id="nonvalid parameters - bool value is None.",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"stringList": "not-a-list"},
+                },
+                "jobRunAsUser": {
+                    "posix": {
+                        "user": "abc",
+                        "group": "abc",
+                    },
+                    "runAs": "QUEUE_CONFIGURED_USER",
+                },
+            },
+            id="nonvalid parameters - stringList value is not a list.",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"intList": [1, 2]},
+                },
+                "jobRunAsUser": {
+                    "posix": {
+                        "user": "abc",
+                        "group": "abc",
+                    },
+                    "runAs": "QUEUE_CONFIGURED_USER",
+                },
+            },
+            id="nonvalid parameters - intList elements are ints, not strings.",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"boolList": "true"},
+                },
+                "jobRunAsUser": {
+                    "posix": {
+                        "user": "abc",
+                        "group": "abc",
+                    },
+                    "runAs": "QUEUE_CONFIGURED_USER",
+                },
+            },
+            id="nonvalid parameters - boolList value is not a list.",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
+                "parameters": {
+                    "param1": {"intListList": [["1"], "2"]},
+                },
+                "jobRunAsUser": {
+                    "posix": {
+                        "user": "abc",
+                        "group": "abc",
+                    },
+                    "runAs": "QUEUE_CONFIGURED_USER",
+                },
+            },
+            id="nonvalid parameters - intListList element is not a nested list.",
         ),
         pytest.param(
             {
@@ -666,3 +859,37 @@ def test_input_validation_failure(data: dict[str, Any]) -> None:
     """Test that validate_entity_data() raises a ValueError when nonvalid input data is provided."""
     with pytest.raises(ValueError):
         JobDetails.validate_entity_data(entity_data=data, job_user_override=None)
+
+
+class TestJobDetailsFromBotoExtensions:
+    """Tests for extensions field extraction from BatchGetJobEntity."""
+
+    @pytest.fixture
+    def valid_job_details_data(self) -> JobDetailsData:
+        return cast(
+            JobDetailsData,
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-2023-09",
+            },
+        )
+
+    def test_extensions_absent_defaults_to_none(
+        self, valid_job_details_data: JobDetailsData
+    ) -> None:
+        # extensions not in the response -> None
+        result = JobDetails.from_boto(valid_job_details_data)
+        assert result.extensions is None
+
+    def test_extensions_empty_list(self, valid_job_details_data: JobDetailsData) -> None:
+        data = cast(JobDetailsData, {**valid_job_details_data, "extensions": []})
+        result = JobDetails.from_boto(data)
+        assert result.extensions == []
+
+    def test_extensions_populated(self, valid_job_details_data: JobDetailsData) -> None:
+        data = cast(
+            JobDetailsData, {**valid_job_details_data, "extensions": ["EXPR", "WRAP_ACTIONS"]}
+        )
+        result = JobDetails.from_boto(data)
+        assert result.extensions == ["EXPR", "WRAP_ACTIONS"]

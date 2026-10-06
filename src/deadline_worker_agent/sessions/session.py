@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import json
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,19 +16,18 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
-    Dict,
     Generator,
     Iterable,
-    List,
     Literal,
     Optional,
     Tuple,
     TypeVar,
 )
-
 from deadline_worker_agent.api_models import (
     EntityIdentifier,
-    SyncInputJobAttachmentsAction,
+    AttachmentDownloadAction,
+    AttachmentUploadAction,
+    ManifestInfo,
 )
 
 if TYPE_CHECKING:
@@ -36,51 +35,45 @@ if TYPE_CHECKING:
     from ..scheduler.session_queue import SessionActionQueue
     from .actions import SessionActionDefinition
     from .job_entities import JobAttachmentDetails, JobDetails
+    from .attachment_models import WorkerManifestProperties
 
-from openjd.model import TaskParameterSet
+from openjd.model import (
+    TaskParameterSet,
+)
 from openjd.sessions import (
     ActionState,
     ActionStatus,
     EnvironmentIdentifier,
     EnvironmentModel,
     LOG as OPENJD_LOG,
-    PathMappingRule,
-    PosixSessionUser,
     StepScriptModel,
-    Session as OPENJDSession,
     SessionUser,
-    WindowsSessionUser,
 )
 
 from deadline.job_attachments.asset_sync import AssetSync
 from deadline.job_attachments.models import (
-    Attachments,
-    JobAttachmentS3Settings,
-    ManifestProperties,
-    PathFormat,
+    UploadManifestInfo,
 )
-from deadline.job_attachments.os_file_permission import (
-    FileSystemPermissionSettings,
-    PosixFileSystemPermissionSettings,
-    WindowsFileSystemPermissionSettings,
-    WindowsPermissionEnum,
-)
-from deadline.job_attachments.progress_tracker import ProgressReportMetadata, SummaryStatistics
+from deadline.job_attachments.progress_tracker import ProgressReportMetadata
 
-from ..aws.deadline import (
-    record_success_fail_telemetry_event,
-    record_sync_inputs_fail_telemetry_event,
-    record_sync_inputs_telemetry_event,
-    record_sync_outputs_telemetry_event,
-)
 from ..scheduler.session_action_status import SessionActionStatus
 from ..sessions.errors import SessionActionError
+from ..aws.deadline import record_runtime_failure_telemetry_event
+from ._extensions import session_extensions
+from .runtime._abc import SessionRuntimeCrashError
+from .runtime import (
+    SessionRuntimeKind,
+    SessionRuntime,
+    SessionRuntimeConfig,
+    create_session_runtime,
+)
 from ..log_messages import (
     SessionLogEvent,
     SessionLogEventSubtype,
     SessionActionLogEvent,
     SessionActionLogEventSubtype,
 )
+from .log_config import ActionOutputCaptureFilter, ActionOutputMessageKind
 
 # TODO: Un-comment this when pipelined actions can be reported as NEVER_ATTEMPTED before the
 # currently canceling action is completed
@@ -95,17 +88,7 @@ OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS: dict[
     ActionState.SUCCESS: "SUCCEEDED",
     ActionState.TIMEOUT: "FAILED",
 }
-DEFAULT_POSIX_OPENJD_SESSION_DIR = Path("/sessions")
 TIME_DELTA_ZERO = timedelta()
-
-# During a SYNC_INPUT_JOB_ATTACHMENTS session action, the transfer rate is periodically reported through
-# a callback function. If a transfer rate lower than LOW_TRANSFER_RATE_THRESHOLD is observed in a series
-# for LOW_TRANSFER_COUNT_THRESHOLD times, it is considered concerning or potentially stalled, and the
-# session action is canceled.
-LOW_TRANSFER_RATE_THRESHOLD = 10 * 10**3  # 10 KB/s
-LOW_TRANSFER_COUNT_THRESHOLD = (
-    60  # Each progress report takes 1 sec at the longest, so 60 reports amount to 1 min in total.
-)
 
 logger = getLogger(__name__)
 
@@ -117,6 +100,9 @@ class ActiveEnvironment:
 
     job_env_id: str
     """A unique identifier that identifies the environment within the Open Job Description job model"""
+
+    resolved_symbol_table_json: str | None = None
+    """Retained so environment teardown resolves the same symbols the enter action used."""
 
 
 @dataclass(frozen=True)
@@ -154,6 +140,7 @@ class Session:
     _queue: SessionActionQueue
     _report_action_update: Callable[[SessionActionStatus], None]
     _stop: Event
+    _output_sync_target_action: CurrentAction | None = None
     _current_action: CurrentAction | None = None
     _current_action_lock: RLock
     _stop_current_action_result: Literal["INTERRUPTED", "FAILED"] = "FAILED"
@@ -166,10 +153,15 @@ class Session:
     _retain_session_dir: bool = False
     _job_details: JobDetails
     _job_attachment_details: JobAttachmentDetails | None = None
+    _upload_manifest_list: list[UploadManifestInfo] = []
 
     # Event that is set only when this Session is not running at all
     # i.e. it has exited, or never started, its main run loop/logic.
     _stopped_running: Event
+
+    _manifest_paths_by_root: dict[str, list[str]] = dict()
+
+    _action_output_log_filter: Optional[ActionOutputCaptureFilter]
 
     logger: LoggerAdapter
 
@@ -184,11 +176,22 @@ class Session:
         asset_sync: Optional[AssetSync],
         os_user: SessionUser | None,
         retain_session_dir: bool = False,
+        session_runtime_kind: SessionRuntimeKind = SessionRuntimeKind.PYTHON,
         job_details: JobDetails,
         action_update_callback: Callable[[SessionActionStatus], None],
         action_update_lock: RLock,
+        session_root_dir: Path,
+        farm_id: str = "",
+        region: Optional[str] = None,
+        resolved_symbol_table_json: str | None = None,
     ) -> None:
         self._id = id
+        self._session_runtime_kind = session_runtime_kind
+        self._farm_id = farm_id
+        # The farm's home region (the worker's boto session region), used to localize
+        # telemetry findings to the service-side session resource. Not necessarily the
+        # host's physical region on customer-managed fleets.
+        self._region = region
         self._action_update_lock = action_update_lock
         self._active_envs = []
         self._asset_sync = asset_sync
@@ -200,24 +203,30 @@ class Session:
         self._job_details = job_details
         self._report_action_update = action_update_callback
         self._env = env
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=id,
+        )
+        self._worker_manifest_properties_by_local_root: dict[str, WorkerManifestProperties] = {}
 
         def openjd_session_action_callback(session_id: str, action_status: ActionStatus) -> None:
             self.update_action(action_status)
 
-        session_root_directory: Optional[Path] = None
-        if os.name == "posix":
-            session_root_directory = DEFAULT_POSIX_OPENJD_SESSION_DIR
-
-        self._session = OPENJDSession(
-            session_id=self._id,
-            job_parameter_values=self._job_details.parameters,
-            path_mapping_rules=self._job_details.path_mapping_rules,
-            retain_working_dir=self._retain_session_dir,
-            user=self._os_user,
-            callback=openjd_session_action_callback,
-            os_env_vars=self._env,
-            session_root_directory=session_root_directory,
+        self._runtime: SessionRuntime = create_session_runtime(
+            session_runtime_kind,
+            SessionRuntimeConfig(
+                session_id=self._id,
+                job_parameter_values=self._job_details.parameters,
+                path_mapping_rules=self._job_details.path_mapping_rules,
+                retain_working_dir=self._retain_session_dir,
+                user=self._os_user,
+                action_callback=openjd_session_action_callback,
+                os_env_vars=self._env,
+                session_root_directory=session_root_dir,
+                spec_revision="2023-09",
+                supported_extensions=session_extensions(self._job_details.extensions),
+                resolved_symbol_table_json=resolved_symbol_table_json,
+            ),
         )
 
         self._queue = queue
@@ -230,6 +239,17 @@ class Session:
         # 2. It is already set up to not propagate to the agent log; and
         # 3. We're already capturing it to send to cloudwatch.
         self.logger = LoggerAdapter(OPENJD_LOG, extra={"session_id": self._id})
+        self._action_output_log_filter = None
+
+    @property
+    def runtime(self) -> SessionRuntime:
+        """The session runtime adapter for this session"""
+        return self._runtime
+
+    @property
+    def working_directory(self) -> Path:
+        """The working directory for this session"""
+        return self._runtime.working_directory
 
     @property
     def id(self) -> str:
@@ -240,6 +260,61 @@ class Session:
     def os_user(self) -> Optional[SessionUser]:
         """The session user"""
         return self._os_user
+
+    @property
+    def worker_manifest_properties_by_local_root(self) -> dict[str, WorkerManifestProperties]:
+        """Worker-specific manifest properties dictionary keyed by local root path for enhanced job attachment processing"""
+        return self._worker_manifest_properties_by_local_root
+
+    def set_worker_manifest_properties(
+        self, worker_manifest_properties: WorkerManifestProperties
+    ) -> None:
+        """Add worker manifest properties to the cached dictionary
+
+        Parameters
+        ----------
+        worker_manifest_properties : WorkerManifestProperties
+            Worker manifest properties to add to the cached session dictionary
+        """
+        self._worker_manifest_properties_by_local_root[
+            worker_manifest_properties.local_root_path
+        ] = worker_manifest_properties
+
+    def get_worker_manifest_properties_list(self) -> list[WorkerManifestProperties]:
+        """Get the cached worker manifest properties as a list
+
+        Returns
+        -------
+        list[WorkerManifestProperties]
+            The cached list of worker manifest properties
+        """
+        return list(self._worker_manifest_properties_by_local_root.values())
+
+    def add_local_manifest_path(
+        self, local_root_path: str, manifest_path: str
+    ) -> WorkerManifestProperties:
+        """Add a local manifest path to the worker manifest properties
+
+        Parameters
+        ----------
+        local_root_path : str
+            The local root path key to look up the worker manifest properties
+        manifest_path : str
+            The manifest path to add to the local_manifest_paths list
+
+        Raises
+        ------
+        ValueError
+            If the local_root_path is not found in the worker manifest properties dictionary
+        """
+        if worker_props := self._worker_manifest_properties_by_local_root.get(local_root_path):
+            worker_props.local_manifest_paths.append(manifest_path)
+
+            return worker_props
+        else:
+            raise ValueError(
+                f"Worker manifest properties not found for local_root_path: {local_root_path}"
+            )
 
     def _warm_job_entities_cache(self) -> None:
         """Attempts to cache the job entities response for all
@@ -298,6 +373,7 @@ class Session:
             # service. If an action was running at the time of this exception, its failure is
             # reported immediately in the call to Session._cleanup() below.
             self._stop_fail_message = f"Worker encountered an unexpected error: {e}"
+            self.logger.error(self._stop_fail_message)
             self._stop.set()
             raise
         finally:
@@ -321,13 +397,12 @@ class Session:
         self._stopped_running.wait(timeout=timeout.seconds if timeout else None)
 
     def _run(self) -> None:
-        """The contains the main run loop for processing session actions.
+        """The function contains the main run loop for processing session actions.
 
         This code will loop until Session.stop() is called from another thread.
         """
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            self._executor = executor
+        with self._executor:
             while not self._stop.wait(timeout=0.1):
                 # Start session action if needed
                 with (
@@ -395,7 +470,11 @@ class Session:
         # After canceling the running action, we exit any active environments
         actions.extend(
             (
-                partial(self._session.exit_environment, identifier=env.session_env_id),
+                partial(
+                    self._runtime.exit_environment,
+                    identifier=env.session_env_id,
+                    resolved_symbol_table_json=env.resolved_symbol_table_json,
+                ),
                 f"exit environment {env.job_env_id}",
             )
             for env in reversed(self._active_envs)
@@ -428,7 +507,7 @@ class Session:
                 except TimeoutError:
                     # Log, cancel the cleanup action and break the loop if we've run out of grace time
                     logger.warning("%s timed out", desc)
-                    self._session.cancel_action()
+                    self._runtime.cancel_action()
                     break
                 else:
                     logger.info("%s successful", desc)
@@ -437,17 +516,19 @@ class Session:
             if self._asset_sync is not None and self._job_attachment_details is not None:
                 # Perform any cleanup the job attachments system needs to do
                 self._asset_sync.cleanup_session(
-                    session_dir=self._session.working_directory,
+                    session_dir=self._runtime.working_directory,
                     file_system=self._job_attachment_details.job_attachments_file_system,
                     os_user=self._os_user.user if self._os_user else None,
                 )
             # Clean-up the Open Job Description session
-            self._session.cleanup()
+            self._runtime.cleanup()
 
     def replace_assigned_actions(
         self,
         *,
-        actions: Iterable[EnvironmentAction | TaskRunAction | SyncInputJobAttachmentsAction],
+        actions: Iterable[
+            EnvironmentAction | TaskRunAction | AttachmentDownloadAction | AttachmentUploadAction
+        ],
     ) -> None:
         """Replaces the assigned actions
 
@@ -461,7 +542,7 @@ class Session:
 
         Parameters
         ----------
-        actions : Iterable[EnvironmentAction | TaskRunAction | SyncInputJobAttachmentsAction]
+        actions : Iterable[EnvironmentAction | TaskRunAction | AttachmentDownloadAction | AttachmentUploadAction]
             The new sequence of actions to be assigned to the session. The order of the actions
             provided is used as the processing order
         """
@@ -471,7 +552,9 @@ class Session:
     def _replace_assigned_actions_impl(
         self,
         *,
-        actions: Iterable[EnvironmentAction | TaskRunAction | SyncInputJobAttachmentsAction],
+        actions: Iterable[
+            EnvironmentAction | TaskRunAction | AttachmentDownloadAction | AttachmentUploadAction
+        ],
     ) -> None:
         """Replaces the assigned actions
 
@@ -632,6 +715,24 @@ class Session:
                 executor=self._executor,
             )
         except Exception as e:
+            if isinstance(e, SessionRuntimeCrashError):
+                # A runtime crash (e.g. a Rust panic converted at the adapter
+                # boundary) — record it with runtime attribution. Constant
+                # failure_reason: free exception text never reaches telemetry.
+                record_runtime_failure_telemetry_event(
+                    runtime_kind=self._session_runtime_kind.value,
+                    failure_reason="runtime crash",
+                    exception_type=type(e.__cause__).__name__ if e.__cause__ else "unknown",
+                    runtime_hint=None,
+                    session_id=self.id,
+                    queue_id=self._queue_id,
+                    farm_id=self._farm_id,
+                    region=self._region,
+                )
+            if self._output_sync_target_action:
+                action_definition = self._output_sync_target_action.definition
+                self._output_sync_target_action = None
+
             logger.error(
                 SessionActionLogEvent(
                     subtype=SessionActionLogEventSubtype.END,
@@ -743,7 +844,7 @@ class Session:
                 f"yield_frequency must be a positive timedelta or None, but got {frequency}"
             )
 
-        if self._session.action_status is None:
+        if self._runtime.action_status is None:
             raise RuntimeError("No action is running")
 
         start_time = monotonic()
@@ -751,24 +852,24 @@ class Session:
         remaining_time: timedelta | None = timeout
         if timeout:
             while (
-                self._session.action_status.state
+                self._runtime.action_status.state
                 not in OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS
             ):
                 elapsed_time = timedelta(seconds=cur_time - start_time)
                 remaining_time = timeout - elapsed_time
 
                 if elapsed_time > TIME_DELTA_ZERO:
-                    yield self._session.action_status
+                    yield self._runtime.action_status
 
                 if remaining_time <= TIME_DELTA_ZERO:
                     raise TimeoutError()
                 sleep(min(frequency, remaining_time).total_seconds())
                 cur_time = monotonic()
         else:
-            if self._session.action_status.state == ActionState.RUNNING:
+            if self._runtime.action_status.state == ActionState.RUNNING:
                 sleep(frequency.total_seconds())
-            while self._session.action_status.state == ActionState.RUNNING:
-                yield self._session.action_status
+            while self._runtime.action_status.state == ActionState.RUNNING:
+                yield self._runtime.action_status
                 sleep(frequency.total_seconds())
 
     def enter_environment(
@@ -777,14 +878,23 @@ class Session:
         job_env_id: str,
         environment: EnvironmentModel,
         os_env_vars: Optional[dict[str, str]] = None,
+        resolved_symbol_table_json: str | None = None,
+        step_name: str | None = None,
+        step_let_declarations: list[str] | None = None,
     ) -> None:
-        session_env_id = self._session.enter_environment(
-            environment=environment, identifier=job_env_id, os_env_vars=os_env_vars
+        session_env_id = self._runtime.enter_environment(
+            environment=environment,
+            identifier=job_env_id,
+            os_env_vars=os_env_vars,
+            resolved_symbol_table_json=resolved_symbol_table_json,
+            step_name=step_name,
+            step_let_declarations=step_let_declarations,
         )
         self._active_envs.append(
             ActiveEnvironment(
                 job_env_id=job_env_id,
                 session_env_id=session_env_id,
+                resolved_symbol_table_json=resolved_symbol_table_json,
             )
         )
 
@@ -793,6 +903,7 @@ class Session:
         *,
         job_env_id: str,
         os_env_vars: Optional[dict[str, str]] = None,
+        resolved_symbol_table_json: str | None = None,
     ) -> None:
         if not self._active_envs or self._active_envs[-1].job_env_id != job_env_id:
             env_stack_str = ", ".join(env.job_env_id for env in self._active_envs)
@@ -801,8 +912,18 @@ class Session:
                 f"Active environments from outer-most to inner-most are: {env_stack_str}"
             )
         active_env = self._active_envs[-1]
-        self._session.exit_environment(
-            identifier=active_env.session_env_id, os_env_vars=os_env_vars
+        # The exit action's own table is preferred; the enter-time table is used
+        # when the service omits one, because the runtime does not replay
+        # enter-time symbols.
+        effective_table = (
+            resolved_symbol_table_json
+            if resolved_symbol_table_json is not None
+            else active_env.resolved_symbol_table_json
+        )
+        self._runtime.exit_environment(
+            identifier=active_env.session_env_id,
+            os_env_vars=os_env_vars,
+            resolved_symbol_table_json=effective_table,
         )
         self._active_envs.pop()
 
@@ -816,177 +937,6 @@ class Session:
         current_action is added by the Worker Agent (via partial)
         progress and status message are passed in by Job Attachments."""
         return True
-
-    @record_success_fail_telemetry_event()  # type: ignore
-    def sync_asset_inputs(
-        self,
-        *,
-        cancel: Event,
-        job_attachment_details: JobAttachmentDetails | None = None,
-        step_dependencies: list[str] | None = None,
-    ) -> None:
-        """Sync the inputs on session start using Job Attachments"""
-        if self._asset_sync is None:
-            return
-
-        low_transfer_count = 0
-
-        def progress_handler(job_attachments_download_status: ProgressReportMetadata) -> bool:
-            """
-            Callback for Job Attachments' sync_inputs() to track the download progress.
-            Returns True if the operation should continue as normal or False to cancel.
-            """
-            # Check the transfer rate from the progress report. It monitors for a series of
-            # alarmingly low transfer rates, and if the count exceeds the specified threshold,
-            # cancels the download and fails the current (SYNC_INPUT_JOB_ATTACHMENTS) action.
-            nonlocal low_transfer_count
-            transfer_rate = job_attachments_download_status.transferRate
-
-            if transfer_rate < LOW_TRANSFER_RATE_THRESHOLD:
-                low_transfer_count += 1
-            else:
-                low_transfer_count = 0
-            if low_transfer_count >= LOW_TRANSFER_COUNT_THRESHOLD:
-                cancel.set()
-                action_status = ActionStatus(
-                    state=ActionState.FAILED,
-                    fail_message=(
-                        f"Input syncing failed due to successive low transfer rates (< {LOW_TRANSFER_RATE_THRESHOLD / 1000} KB/s). "
-                        f"The transfer rate was below the threshold for the last {self._seconds_to_minutes_str(LOW_TRANSFER_COUNT_THRESHOLD)}."
-                    ),
-                )
-                self.update_action(action_status)
-                # Send the telemetry data of input syncing failure due to insufficient download speed.
-                record_sync_inputs_fail_telemetry_event(
-                    queue_id=self._queue_id,
-                    failure_reason=(f"Insufficient download speed: {action_status.fail_message}"),
-                )
-                return False
-
-            self.update_action(
-                action_status=ActionStatus(
-                    state=ActionState.RUNNING,
-                    status_message=job_attachments_download_status.progressMessage,
-                    progress=job_attachments_download_status.progress,
-                ),
-            )
-            return not cancel.is_set()
-
-        if not (job_attachment_settings := self._job_details.job_attachment_settings):
-            raise RuntimeError("Job attachment settings were not contained in JOB_DETAILS entity")
-
-        if job_attachment_details:
-            self._job_attachment_details = job_attachment_details
-
-        # Validate that job attachment details have been provided before syncing step dependencies.
-        if self._job_attachment_details is None:
-            raise RuntimeError(
-                "Job attachments must be synchronized before downloading Step dependencies."
-            )
-
-        assert job_attachment_settings.s3_bucket_name is not None
-        assert job_attachment_settings.root_prefix is not None
-
-        s3_settings = JobAttachmentS3Settings(
-            s3BucketName=job_attachment_settings.s3_bucket_name,
-            rootPrefix=job_attachment_settings.root_prefix,
-        )
-
-        manifest_properties_list: list[ManifestProperties] = []
-        if not step_dependencies:
-            for manifest_properties in self._job_attachment_details.manifests:
-                manifest_properties_list.append(
-                    ManifestProperties(
-                        rootPath=manifest_properties.root_path,
-                        fileSystemLocationName=manifest_properties.file_system_location_name,
-                        rootPathFormat=PathFormat(manifest_properties.root_path_format),
-                        inputManifestPath=manifest_properties.input_manifest_path,
-                        inputManifestHash=manifest_properties.input_manifest_hash,
-                        outputRelativeDirectories=manifest_properties.output_relative_directories,
-                    )
-                )
-
-        attachments = Attachments(
-            manifests=manifest_properties_list,
-            fileSystem=self._job_attachment_details.job_attachments_file_system,
-        )
-
-        storage_profiles_path_mapping_rules_dict: dict[str, str] = {
-            str(rule.source_path): str(rule.destination_path)
-            for rule in self._job_details.path_mapping_rules
-        }
-
-        fs_permission_settings: Optional[FileSystemPermissionSettings] = None
-        if self._os_user is not None:
-            if os.name == "posix":
-                if not isinstance(self._os_user, PosixSessionUser):
-                    raise ValueError(f"The user must be a posix-user. Got {type(self._os_user)}")
-                fs_permission_settings = PosixFileSystemPermissionSettings(
-                    os_user=self._os_user.user,
-                    os_group=self._os_user.group,
-                    dir_mode=0o20,
-                    file_mode=0o20,
-                )
-            else:
-                if not isinstance(self._os_user, WindowsSessionUser):
-                    raise ValueError(f"The user must be a windows-user. Got {type(self._os_user)}")
-                if self._os_user.user is not None:
-                    fs_permission_settings = WindowsFileSystemPermissionSettings(
-                        os_user=self._os_user.user,
-                        dir_mode=WindowsPermissionEnum.WRITE,
-                        file_mode=WindowsPermissionEnum.WRITE,
-                    )
-
-        # Add path mapping rules for root paths in job attachments
-        self.logger.info("Syncing inputs using Job Attachments")
-        download_summary_statistics: SummaryStatistics
-        path_mapping_rules: List[Dict[str, str]]
-        (download_summary_statistics, path_mapping_rules) = self._asset_sync.sync_inputs(
-            s3_settings=s3_settings,
-            attachments=attachments,
-            queue_id=self._queue_id,  # only used for error message
-            job_id=self._queue._job_id,  # only used for error message
-            session_dir=self._session.working_directory,
-            fs_permission_settings=fs_permission_settings,  # type: ignore[arg-type]
-            storage_profiles_path_mapping_rules=storage_profiles_path_mapping_rules_dict,
-            step_dependencies=step_dependencies,
-            on_downloading_files=progress_handler,
-            os_env_vars=self._env,
-        )
-
-        self.logger.info(f"Summary Statistics for file downloads:\n{download_summary_statistics}")
-
-        # Send the summary stats of input syncing through the telemetry client.
-        record_sync_inputs_telemetry_event(self._queue_id, download_summary_statistics)
-
-        job_attachment_path_mappings = [
-            PathMappingRule.from_dict(rule) for rule in path_mapping_rules
-        ]
-
-        # Open Job Description session implementation details -- path mappings are sorted.
-        # bisect.insort only supports the 'key' arg in 3.10 or later, so
-        # we first extend the list and sort it afterwards.
-        if self._session._path_mapping_rules:
-            self._session._path_mapping_rules.extend(job_attachment_path_mappings)
-        else:
-            self._session._path_mapping_rules = job_attachment_path_mappings
-
-        # Open Job Description Sessions sort the path mapping rules based on length of the parts make
-        # rules that are subsets of each other behave in a predictable manner. We must
-        # sort here since we're modifying that internal list appending to the list.
-        self._session._path_mapping_rules.sort(key=lambda rule: -len(rule.source_path.parts))
-
-    def _seconds_to_minutes_str(self, seconds: int) -> str:
-        minutes = seconds // 60
-        remaining_seconds = seconds % 60
-        if minutes > 0 and remaining_seconds > 0:
-            return f"{minutes} minute{'s' if minutes != 1 else ''} {remaining_seconds} second{'s' if remaining_seconds != 1 else ''}"
-        elif minutes > 0:
-            return f"{minutes} minute{'s' if minutes != 1 else ''}"
-        elif remaining_seconds == 0:
-            return "0 seconds"
-        else:
-            return f"{remaining_seconds} second{'s' if remaining_seconds != 1 else ''}"
 
     def update_action(self, action_status: ActionStatus) -> None:
         """Callback called on every Open Job Description status/progress update and the completion/exit of the
@@ -1013,12 +963,35 @@ class Session:
         ):
             self._action_updated_impl(action_status=action_status, now=now)
 
+    def _action_output_log_filter_callback(
+        self, message_type: ActionOutputMessageKind, value: Any
+    ) -> None:
+        """Callback for the action output log filter
+        This callback is called when the output log filter is triggered.
+        """
+        if message_type == ActionOutputMessageKind.JA_SNAPSHOT:
+            self.add_local_manifest_path(
+                local_root_path=value["root"], manifest_path=value["manifest"]
+            )
+        if message_type == ActionOutputMessageKind.JA_UPLOAD:
+            try:
+                manifest_list_data = json.loads(value)
+                self._upload_manifest_list = [
+                    UploadManifestInfo(**item) for item in manifest_list_data
+                ]
+            except (TypeError, ValueError) as e:
+                logger.error(
+                    f"Failed to parse manifest snapshot: {e}",
+                    exc_info=True,
+                )
+                self._upload_manifest_list = []
+
     def _action_updated_impl(
         self,
         *,
         action_status: ActionStatus,
         now: datetime,
-    ) -> None:
+    ) -> Optional[Future]:
         """Internal implementation for the callback invoked on every Open Job Description status/progress
         update and the completion/exit of the current action. The caller should acquire the
         Session._current_action_lock before calling this method.
@@ -1060,12 +1033,12 @@ class Session:
             if action_status.state != ActionState.RUNNING:
                 self._current_action = None
                 self._interrupted = False
-            return
+            return None
 
         current_action = self._current_action
         if current_action is None:
             assert self._stop.is_set(), "current_action is None or stopping"
-            return
+            return None
 
         is_unsuccessful = action_status.state in (
             ActionState.FAILED,
@@ -1073,64 +1046,93 @@ class Session:
             ActionState.TIMEOUT,
         )
 
+        if self._output_sync_target_action is not None:
+            if OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS.get(action_status.state, None):
+                manifests_list = None
+
+                # Get job attachment details to access input manifests
+                job_attachment_details = self._job_attachment_details
+
+                if job_attachment_details:
+                    manifests_list = []
+                    # For each input manifest, find the corresponding output manifest
+                    for input_manifest in job_attachment_details.manifests:
+                        asset_root = input_manifest.root_path
+                        manifest_info = None
+
+                        for output_manifest in self._upload_manifest_list:
+                            if (
+                                output_manifest.source_path is not None
+                                and output_manifest.source_path == asset_root
+                            ):
+                                manifest_info = output_manifest
+                                break
+
+                        # Create a ManifestInfo dictionary with the appropriate values
+                        manifest_info_obj: ManifestInfo = {}
+
+                        if manifest_info:
+                            manifest_info_obj["outputManifestPath"] = (
+                                manifest_info.output_manifest_path
+                            )
+
+                            manifest_info_obj["outputManifestHash"] = (
+                                manifest_info.output_manifest_hash
+                            )
+
+                        manifests_list.append(manifest_info_obj)
+
+                # if the current action is a sync output job attachments upload action and it's completed
+                # then we can update and clear the corresponding task run sync target action
+                task_run_action = self._output_sync_target_action
+                self._output_sync_target_action = None
+
+                if self._action_output_log_filter:
+                    OPENJD_LOG.removeFilter(self._action_output_log_filter)
+
+                # Handle the action update
+                self._handle_action_update(
+                    is_unsuccessful, action_status, task_run_action, now, manifests_list
+                )
+            else:
+                logger.debug(
+                    f"SYNC_OUTPUT_JOB_ATTACHMENTS for {self._output_sync_target_action} is still running"
+                )
+
+            return None
+
         if (
             action_status.state == ActionState.SUCCESS
             and isinstance(current_action.definition, RunStepTaskAction)
             and self._asset_sync is not None
+            # Job attachment details check to make sure the queue has job attachment configured
+            and self._job_attachment_details is not None
         ):
-            # Synchronizing job output attachments is currently bundled together with the
-            # RunStepTaskAction. The synchronization happens after the task run succeeds,
-            # and both must be successful in order to mark the action as SUCCEEDED.
-
-            # Banner matching the subsection banner generated by openjd-sessions
-            self.logger.info("----------------------------------------------")
-            self.logger.info("Uploading output files to Job Attachments")
-            self.logger.info("----------------------------------------------")
-            future: Future = self._executor.submit(
-                self._sync_asset_outputs,
-                current_action=current_action,
+            # Finished task run for a run step task action.
+            # This session has attachment, create attachment upload action and insert to the front of queue
+            assert current_action.definition.step_id is not None
+            action = AttachmentUploadAction(
+                sessionActionId=current_action.definition._id,
+                actionType="SYNC_OUTPUT_JOB_ATTACHMENTS",
+                stepId=current_action.definition.step_id,
+                startTime=current_action.start_time.timestamp(),
             )
-            on_done_with_sync_asset_outputs = partial(
-                self._on_done_with_sync_asset_outputs,
-                is_unsuccessful=is_unsuccessful,
-                action_status=action_status,
-                current_action=current_action,
-            )
-            future.add_done_callback(on_done_with_sync_asset_outputs)
+            if current_action.definition.task_id is not None:
+                action["taskId"] = current_action.definition.task_id
 
+            if not self._action_output_log_filter:
+                self._action_output_log_filter = ActionOutputCaptureFilter(
+                    session_id=self.id, callback=self._action_output_log_filter_callback
+                )
+
+            OPENJD_LOG.addFilter(self._action_output_log_filter)
+
+            self._queue.insert_front(action=action)
+            self._output_sync_target_action = self._current_action
+            self._current_action = None
         else:
             self._handle_action_update(is_unsuccessful, action_status, current_action, now)
-
-    def _on_done_with_sync_asset_outputs(
-        self,
-        future: Future[None],
-        is_unsuccessful: bool,
-        action_status: ActionStatus,
-        current_action: CurrentAction,
-    ):
-        try:
-            future.result()
-        except Exception as e:
-            # Log and fail the task run action if we are unable to sync output job attachments
-            fail_message = (
-                f"Failed to sync job output attachments for {current_action.definition.id}: {e}"
-            )
-            self.logger.warning(fail_message)
-            action_status = ActionStatus(state=ActionState.FAILED, fail_message=fail_message)
-            is_unsuccessful = True
-        finally:
-            # The time when the action is completed should be the moment when
-            # the synchronization have been finished.
-            now = datetime.now(tz=timezone.utc)
-            with (
-                # NOTE: Acquire the locks here to ensure thread-safe access during action update.
-                # Lock acquisition order is important. Must be:
-                #     1.  action update lock (scheduler owned)
-                #     2.  current action lock
-                self._action_update_lock,
-                self._current_action_lock,
-            ):
-                self._handle_action_update(is_unsuccessful, action_status, current_action, now)
+        return None
 
     def _handle_action_update(
         self,
@@ -1138,6 +1140,7 @@ class Session:
         action_status: ActionStatus,
         current_action: CurrentAction,
         now: datetime,
+        manifests: list[ManifestInfo] | None = None,
     ):
         completed_status = OPENJD_ACTION_STATE_TO_DEADLINE_COMPLETED_STATUS.get(
             action_status.state, None
@@ -1194,89 +1197,31 @@ class Session:
                 fail_message="TIMEOUT - Exceeded the allotted runtime limit.",
             )
 
-        self._report_action_update(
-            SessionActionStatus(
-                id=current_action.definition.id,
-                status=action_status,
-                start_time=current_action.start_time,
-                end_time=now if action_status.state != ActionState.RUNNING else None,
-                update_time=now if action_status.state == ActionState.RUNNING else None,
-                completed_status=completed_status,
-            )
-        )
+        # Only report action update when it's not attachment upload for syncing job attachment outputs,
+        # progress reporting is not supported by the output upload yet.
+        if not self._output_sync_target_action:
+            # avoid circular import
+            from .actions import RunStepTaskAction
 
-    @record_success_fail_telemetry_event(metric_name="sync_asset_outputs")  # type: ignore
-    def _sync_asset_outputs(
-        self,
-        *,
-        current_action: CurrentAction,
-    ) -> None:
-        """Sync the outputs after a TASK_RUN if using Job Attachments"""
-        if not (queue_settings := self._job_details.job_attachment_settings):
-            return
-        if not (job_attachment_details := self._job_attachment_details):
-            return
-        if self._asset_sync is None:
-            # Shouldn't get here, but let's be defensive.
-            return
+            # Only include manifests for successfully completed RunStepTaskActions
+            session_manifests = None
+            if completed_status == "SUCCEEDED" and isinstance(
+                current_action.definition, RunStepTaskAction
+            ):
+                # Always report empty list for successful task runs to differentiate from old workers
+                session_manifests = manifests if manifests is not None else []
 
-        # assist type check
-        assert queue_settings.root_prefix is not None
-
-        # Turn worker agent job attachment settings into job attachment settings
-        s3_settings = JobAttachmentS3Settings(
-            s3BucketName=queue_settings.s3_bucket_name,
-            rootPrefix=queue_settings.root_prefix,
-        )
-
-        manifest_properties_list: list[ManifestProperties] = []
-        for manifest_properties in job_attachment_details.manifests:
-            manifest_properties_list.append(
-                ManifestProperties(
-                    rootPath=manifest_properties.root_path,
-                    fileSystemLocationName=manifest_properties.file_system_location_name,
-                    rootPathFormat=PathFormat(manifest_properties.root_path_format),
-                    inputManifestPath=manifest_properties.input_manifest_path,
-                    inputManifestHash=manifest_properties.input_manifest_hash,
-                    outputRelativeDirectories=manifest_properties.output_relative_directories,
+            self._report_action_update(
+                SessionActionStatus(
+                    id=current_action.definition.id,
+                    status=action_status,
+                    start_time=current_action.start_time,
+                    end_time=now if action_status.state != ActionState.RUNNING else None,
+                    update_time=now if action_status.state == ActionState.RUNNING else None,
+                    completed_status=completed_status,
+                    manifests=session_manifests,
                 )
             )
-
-        attachments = Attachments(
-            manifests=manifest_properties_list,
-            fileSystem=job_attachment_details.job_attachments_file_system,
-        )
-
-        storage_profiles_path_mapping_rules_dict: dict[str, str] = {
-            str(rule.source_path): str(rule.destination_path)
-            for rule in self._job_details.path_mapping_rules
-        }
-
-        self.logger.info("Started syncing outputs using Job Attachments")
-        # avoid circular import
-        from .actions import RunStepTaskAction
-
-        assert isinstance(current_action.definition, RunStepTaskAction)
-        upload_summary_statistics: SummaryStatistics = self._asset_sync.sync_outputs(
-            s3_settings=s3_settings,
-            attachments=attachments,
-            queue_id=self._queue_id,
-            job_id=self._queue._job_id,
-            step_id=current_action.definition.step_id,  # type: ignore[arg-type]
-            task_id=current_action.definition.task_id,
-            session_action_id=current_action.definition.id,
-            start_time=current_action.start_time.timestamp(),
-            session_dir=self._session.working_directory,
-            storage_profiles_path_mapping_rules=storage_profiles_path_mapping_rules_dict,
-            on_uploading_files=self._notifier_callback,
-        )
-
-        self.logger.info(f"Summary Statistics for file uploads:\n{upload_summary_statistics}")
-
-        # Send the summary stats of output syncing through the telemetry client.
-        record_sync_outputs_telemetry_event(self._queue_id, upload_summary_statistics)
-
-        self.logger.info("Finished syncing outputs using Job Attachments")
 
     def run_task(
         self,
@@ -1284,11 +1229,32 @@ class Session:
         step_script: StepScriptModel,
         task_parameter_values: TaskParameterSet,
         os_env_vars: Optional[dict[str, str]] = None,
+        log_task_banner: bool = True,
+        step_name: str | None = None,
+        resolved_symbol_table_json: str | None = None,
     ) -> None:
-        self._session.run_task(
+        self._runtime.run_task(
             step_script=step_script,
             task_parameter_values=task_parameter_values,
             os_env_vars=os_env_vars,
+            log_task_banner=log_task_banner,
+            step_name=step_name,
+            resolved_symbol_table_json=resolved_symbol_table_json,
+        )
+
+    def _run_attachment_sync_task(
+        self,
+        *,
+        step_script: StepScriptModel,
+        task_parameter_values: TaskParameterSet,
+        os_env_vars: Optional[dict[str, str]] = None,
+        log_task_banner: bool = True,
+    ) -> None:
+        self._runtime._run_task_without_session_env(
+            step_script=step_script,
+            task_parameter_values=task_parameter_values,
+            os_env_vars=os_env_vars,
+            log_task_banner=log_task_banner,
         )
 
     def stop(

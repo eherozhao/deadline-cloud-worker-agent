@@ -1,15 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 
 from __future__ import annotations
+
+import json
+import logging
+import re
+from collections.abc import Generator
 from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
-from pathlib import Path
-from typing import ContextManager, Generator
-import logging
 
-from ..log_sync.cloudwatch import (
+from pathlib import Path
+from typing import Any, Callable, ContextManager
+
+from ..log_sync.log_constants import (
     LOG_CONFIG_OPTION_GROUP_NAME_KEY,
     LOG_CONFIG_OPTION_STREAM_NAME_KEY,
 )
@@ -113,6 +118,111 @@ class SessionLogFilter(logging.Filter):
         )
 
 
+class ActionOutputMessageKind(Enum):
+    JA_SNAPSHOT = "ja_snapshot"
+    JA_UPLOAD = "ja_upload"
+
+
+class ActionOutputCaptureFilter(logging.Filter):
+    """A logging filter that captures and processes action output messages.
+
+    This filter intercepts log messages that match specific patterns related to ActionOutputMessageKind
+    and processes them through appropriate handlers. It only processes messages from the specified
+    session ID and passes the extracted data to the provided callback function.
+    """
+
+    _FILTER_MATCHER = re.compile(
+        "^(?:"
+        f"{'|'.join(f'(?P<{re.escape(v.value)}>{re.escape(v.value)})' for v in ActionOutputMessageKind)}"
+        "): (.+)$"
+    )
+    """Regular expression pattern used to match and extract action output messages.
+
+    The pattern matches strings that start with one of the ActionOutputMessageKind values
+    followed by a colon and space, then captures the remaining content.
+    """
+
+    _callback: Callable[[ActionOutputMessageKind, Any], None]
+    """Callback to invoke when one of the Open Job Description update messages is detected."""
+
+    _session_id: str
+    """The id that we're looking for in LogRecords.
+    We only process records with the "session_id" attribute set to this value.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        callback: Callable[[ActionOutputMessageKind, Any], None],
+    ):
+        super().__init__()
+        self._session_id = session_id
+        self._callback = callback
+        self._internal_handlers = {
+            ActionOutputMessageKind.JA_SNAPSHOT: self._handle_ja_snapshot,
+            ActionOutputMessageKind.JA_UPLOAD: self._handle_ja_upload,
+        }
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "session_id") or record.session_id != self._session_id:
+            # Not a record for us to process
+            return True
+        if not isinstance(record.msg, str):
+            # If something sends a non-string to the logger (e.g. via logger.exception) then
+            # don't try to string match it.
+            return True
+
+        match = ActionOutputCaptureFilter._FILTER_MATCHER.match(record.msg)
+        if match and match.lastindex is not None:
+            # successfully matched one of the patterns
+            # and can extract the message content from the last capturing group
+            message = match.group(match.lastindex)
+            # Note: keys of match.groupdict() are the names of named groups in the regex
+            matched_named_groups = tuple(k for k, v in match.groupdict().items() if v is not None)
+            if len(matched_named_groups) > 1:
+                # The only way that this happens is if filter_matcher is constructed incorrectly.
+                all_matched_groups = ",".join(k for k in matched_named_groups)
+                logger.error(
+                    f"Malformed output stream filter matched multiple kinds ({all_matched_groups})",
+                )
+                return True
+            message_kind = ActionOutputMessageKind(matched_named_groups[0])
+            try:
+                handler = self._internal_handlers[message_kind]
+            except KeyError:
+                logger.error(
+                    f"Unhandled message kind ({message_kind.value})",
+                )
+                return True
+            try:
+                handler(message)
+            except ValueError as e:
+                record.msg = record.msg + f" -- ERROR: {e!s}"
+                # There was an error. Don't suppress the message from the log.
+                return True
+
+        return True
+
+    def _handle_ja_snapshot(self, message: str) -> None:
+        """Local handling of job attachments manifest snapshot.
+        Process the message and pass it to the callback.
+
+        Args:
+            message (str): The message after the leading 'ja_snapshot: ' prefix
+        """
+        # TODO - cast to type ManifestSnapshot once the change is available
+        self._callback(ActionOutputMessageKind.JA_SNAPSHOT, json.loads(message))
+
+    def _handle_ja_upload(self, message: str) -> None:
+        """Local handling of job attachments upload result.
+        Process the message and pass it to the callback.
+
+        Args:
+            message (str): The message after the leading 'ja_upload: ' prefix
+        """
+        self._callback(ActionOutputMessageKind.JA_UPLOAD, message)
+
+
 @dataclass
 class LogConfiguration:
     """The session's log configuration
@@ -175,7 +285,7 @@ class LogConfiguration:
             log_driver = LogDriver(log_configuration["logDriver"])
         except ValueError:
             raise ValueError(
-                f"Unsupported log driver: \"{log_configuration['logDriver']}\""
+                f'Unsupported log driver: "{log_configuration["logDriver"]}"'
             ) from None
 
         return LogConfiguration(

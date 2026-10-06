@@ -15,7 +15,6 @@ from getpass import getpass
 from pathlib import Path
 from typing import Any, Optional, Union
 
-import deadline.client.config.config_file
 import pywintypes
 import win32api
 import win32con
@@ -29,19 +28,22 @@ import winerror
 from openjd.sessions import BadCredentialsException, WindowsSessionUser
 from win32comext.shell import shell
 
+from ..config.config_file import (
+    ConfigFile,
+    ModifiableSetting,
+    SettingModification,
+)
 from ..file_system_operations import (
     _set_windows_permissions,
     FileSystemPermissionEnum,
 )
 from ..windows.win_service import WorkerAgentWindowsService
 from ..windows.win_logon import generate_password, users_equal
+from ..windows.win_user import is_domain_user
 
 # Defaults
 DEFAULT_WA_USER = "deadline-worker"
 DEFAULT_JOB_GROUP = "deadline-job-users"
-
-# Environment variable that overrides the config path used by the Deadline client
-DEADLINE_CLIENT_CONFIG_PATH_OVERRIDE_ENV_VAR = "DEADLINE_CONFIG_FILE_PATH"
 
 
 class InstallerFailedException(Exception):
@@ -185,19 +187,32 @@ def ensure_user_profile_exists(username: str, password: str):
     logon_token = None
     user_profile = None
     try:
+        # Parse domain from username for LogonUser
+        logon_domain = None
+        logon_username = username
+        if "\\" in username:
+            logon_domain, logon_username = username.split("\\", 1)
+
         # https://timgolden.me.uk/pywin32-docs/win32security__LogonUser_meth.html
         logon_token = win32security.LogonUser(
-            Username=username,
+            Username=logon_username,
             LogonType=win32security.LOGON32_LOGON_INTERACTIVE,
             LogonProvider=win32security.LOGON32_PROVIDER_DEFAULT,
             Password=password,
-            Domain=None,
+            Domain=logon_domain,
         )
         # https://timgolden.me.uk/pywin32-docs/win32profile__LoadUserProfile_meth.html
+        # lpUserName is used as the base name of the profile directory.
+        # DDL format (DOMAIN\user) works on modern Windows (it strips the domain internally).
+        # UPN format (user@domain) does NOT work — Windows tries to use it as-is for the folder name.
+        # See: https://support.microsoft.com/en-us/topic/01e698e9-b945-56ad-3c9e-6a3edbc99f81
+        profile_username = username
+        if "@" in username:
+            profile_username = username.split("@")[0]
         user_profile = win32profile.LoadUserProfile(
             logon_token,
             {
-                "UserName": username,
+                "UserName": profile_username,
                 "Flags": win32profile.PI_NOUI,
                 "ProfilePath": None,
             },
@@ -261,7 +276,23 @@ def is_user_in_group(group_name: str, user_name: str) -> bool:
         logging.error(f"Failed to get group members of '{group_name}': {e}")
         raise
 
-    return any(group_member["name"] == user_name for group_member in group_members_info[0])
+    # Compare by SID to avoid false positives when a local user and domain user
+    # share the same short name (e.g. MACHINE\bob vs DOMAIN\bob).
+    try:
+        target_sid, _, _ = win32security.LookupAccountName(None, user_name)
+    except Exception as e:
+        logging.warning(f"Failed to look up SID for '{user_name}': {e}")
+        return False
+
+    for group_member in group_members_info[0]:
+        try:
+            member_sid, _, _ = win32security.LookupAccountName(None, group_member["name"])
+            if member_sid == target_sid:
+                return True
+        except Exception as e:
+            logging.warning(f"Could not resolve SID for group member '{group_member['name']}': {e}")
+            continue
+    return False
 
 
 def add_user_to_group(group_name: str, user_name: str) -> None:
@@ -282,6 +313,14 @@ def add_user_to_group(group_name: str, user_name: str) -> None:
             [user_info],
         )
         logging.info(f"User {user_name} is added to group {group_name}.")
+    except pywintypes.error as e:
+        if e.winerror == 1378:  # ERROR_MEMBER_IN_ALIAS - already a member
+            logging.info(f"User {user_name} is already a member of group {group_name}.")
+        else:
+            logging.error(
+                f"An error occurred during adding user {user_name} to the user group {group_name}: {e}"
+            )
+            raise
     except Exception as e:
         logging.error(
             f"An error occurred during adding user {user_name} to the user group {group_name}: {e}"
@@ -290,12 +329,16 @@ def add_user_to_group(group_name: str, user_name: str) -> None:
 
 
 def update_config_file(
+    *,
     deadline_config_sub_directory: str,
     farm_id: str,
     fleet_id: str,
+    region: str,
+    allow_ec2_instance_profile: bool,
     shutdown_on_stop: Optional[bool] = None,
-    allow_ec2_instance_profile: Optional[bool] = None,
     windows_job_user: Optional[str] = None,
+    session_root_dir: Optional[Path] = None,
+    telemetry_opt_out: bool = False,
 ) -> None:
     """
     Updates the worker configuration file, creating it from the example if it does not exist.
@@ -303,126 +346,85 @@ def update_config_file(
     replaces specific placeholders with the provided values.
 
     Parameters:
-    - deadline_config_sub_directory (str): Subdirectory for Deadline configuration files.
     - farm_id (str): The farm ID to set in the configuration.
     - fleet_id (str): The fleet ID to set in the configuration.
+    - region (str): The AWS region to set in the configuration.
+    - allow_ec2_instance_profile (bool): Whether the agent should be configured to run with[out] an EC2 instance profile.
     - shutdown_on_stop (Optional[bool]): The shutdown_on_stop value to set. Does nothing if set to None.
+    - windows_job_user (Optional[str]): The OS username to be used when running jobs. Overrides the queue's jobRunAs configuration.
+        Does nothing if set to None.
     """
     logging.info("Updating configuration file")
 
-    worker_config_file = os.path.join(deadline_config_sub_directory, "worker.toml")
+    config_path = Path(deadline_config_sub_directory) / "worker.toml"
 
     # Check if the worker.toml file exists, if not, create it from the example
-    if not os.path.isfile(worker_config_file):
+    if not os.path.isfile(config_path):
         # Directory where the script and example configuration files are located.
         script_dir = os.path.dirname(os.path.realpath(__file__))
         example_config_path = os.path.join(script_dir, "worker.toml.example")
-        shutil.copy(example_config_path, worker_config_file)
+        shutil.copy(example_config_path, config_path)
 
-    # Make a backup of the worker configuration file
-    backup_worker_config = worker_config_file + ".bak"
-    shutil.copy(worker_config_file, backup_worker_config)
-
-    # Read the content of the worker configuration file
-    with open(worker_config_file, "r") as file:
-        content = file.read()
-
-    updated_keys = []
-
-    # Replace the placeholders with actual farm_id and fleet_id
-    content = re.sub(
-        r'^# farm_id\s*=\s*("REPLACE-WITH-WORKER-FARM-ID")$',
-        f'farm_id = "{farm_id}"',
-        content,
-        flags=re.MULTILINE,
-    )
-    if not re.search(
-        rf'^farm_id = "{re.escape(farm_id)}"$',
-        content,
-        flags=re.MULTILINE,
-    ):
-        raise InstallerFailedException(f"Failed to configure farm ID in {worker_config_file}")
-    else:
-        updated_keys.append("farm_id")
-    content = re.sub(
-        r'^# fleet_id\s*=\s*("REPLACE-WITH-WORKER-FLEET-ID")$',
-        f'fleet_id = "{fleet_id}"',
-        content,
-        flags=re.MULTILINE,
-    )
-    if not re.search(
-        rf'^fleet_id = "{re.escape(fleet_id)}"$',
-        content,
-        flags=re.MULTILINE,
-    ):
-        raise InstallerFailedException(f"Failed to configure fleet ID in {worker_config_file}")
-    else:
-        updated_keys.append("fleet_id")
+    settings_to_modify: list[SettingModification] = [
+        SettingModification(
+            setting=ModifiableSetting.FARM_ID,
+            value=farm_id,
+        ),
+        SettingModification(
+            setting=ModifiableSetting.FLEET_ID,
+            value=fleet_id,
+        ),
+        SettingModification(
+            setting=ModifiableSetting.REGION,
+            value=region,
+        ),
+        SettingModification(
+            setting=ModifiableSetting.WINDOWS_JOB_USER,
+            value=windows_job_user,
+        ),
+        SettingModification(
+            setting=ModifiableSetting.ALLOW_EC2_INSTANCE_PROFILE,
+            value=allow_ec2_instance_profile,
+        ),
+    ]
     if shutdown_on_stop is not None:
-        shutdown_on_stop_toml = str(shutdown_on_stop).lower()
-        content = re.sub(
-            r"^#*\s*shutdown_on_stop\s*=\s*\w+$",
-            f"shutdown_on_stop = {shutdown_on_stop_toml}",
-            content,
-            flags=re.MULTILINE,
-        )
-        if not re.search(
-            rf"^shutdown_on_stop = {re.escape(shutdown_on_stop_toml)}$",
-            content,
-            flags=re.MULTILINE,
-        ):
-            raise InstallerFailedException(
-                f"Failed to configure shutdown_on_stop in {worker_config_file}"
+        settings_to_modify.append(
+            SettingModification(
+                setting=ModifiableSetting.SHUTDOWN_ON_STOP,
+                value=shutdown_on_stop,
             )
-        else:
-            updated_keys.append("shutdown_on_stop")
-    if allow_ec2_instance_profile is not None:
-        allow_ec2_instance_profile_toml = str(allow_ec2_instance_profile).lower()
-        content = re.sub(
-            r"^#*\s*allow_ec2_instance_profile\s*=\s*\w+$",
-            f"allow_ec2_instance_profile = {allow_ec2_instance_profile_toml}",
-            content,
-            flags=re.MULTILINE,
         )
-        if not re.search(
-            rf"^allow_ec2_instance_profile = {re.escape(allow_ec2_instance_profile_toml)}$",
-            content,
-            flags=re.MULTILINE,
-        ):
-            raise InstallerFailedException(
-                f"Failed to configure allow_ec2_instance_profile in {worker_config_file}"
+    if session_root_dir is not None:
+        settings_to_modify.append(
+            SettingModification(
+                setting=ModifiableSetting.SESSION_ROOT_DIR,
+                value=str(session_root_dir),
             )
-        else:
-            updated_keys.append("allow_ec2_instance_profile")
-
-    if windows_job_user is not None:
-        escaped_username = windows_job_user.replace("\\", "\\\\\\\\")
-        content = re.sub(
-            r'^#*\s*windows_job_user\s*=\s*".{1,512}"$',  # defer validation to OS
-            f'windows_job_user = "{escaped_username}"',
-            content,
-            flags=re.MULTILINE,
         )
-        search_username = windows_job_user.replace("\\", "\\\\")
-        if not re.search(
-            rf'^windows_job_user = "{re.escape(search_username)}"$',
-            content,
-            flags=re.MULTILINE,
-        ):
-            raise InstallerFailedException(
-                f"Failed to configure windows_job_user in {worker_config_file}"
+    if telemetry_opt_out:
+        settings_to_modify.append(
+            SettingModification(
+                setting=ModifiableSetting.TELEMETRY_OPT_OUT,
+                value=True,
             )
-        else:
-            updated_keys.append("windows_job_user")
+        )
 
-    # Write the updated content back to the worker configuration file
-    with open(worker_config_file, "w") as file:
-        file.write(content)
+    updated_keys = [sm.setting.value.setting_name for sm in settings_to_modify]
 
-    logging.info(f"Done configuring {updated_keys} in {worker_config_file}")
+    ConfigFile.modify_config_file_settings(
+        settings_to_modify=settings_to_modify,
+        backup=True,
+        config_path=config_path,
+    )
+
+    logging.info(f"Done configuring {updated_keys} in {config_path}")
 
 
-def provision_directories(agent_username: str) -> WorkerAgentDirectories:
+def provision_directories(
+    *,
+    agent_username: str,
+    session_root_dir: Path,
+) -> WorkerAgentDirectories:
     """
     Creates all required directories for Deadline Worker Agent.
     This function creates the following directories:
@@ -434,6 +436,8 @@ def provision_directories(agent_username: str) -> WorkerAgentDirectories:
 
     Parameters
         agent_username(str): Worker Agent's username used for setting the permission for the directories
+        session_root_dir(Path): Path to the parent directory where the worker agent will create session directories
+            under
 
     Returns
         WorkerAgentDirectories: all directories created in the function
@@ -473,51 +477,25 @@ def provision_directories(agent_username: str) -> WorkerAgentDirectories:
     os.makedirs(deadline_config_subdir, exist_ok=True)
     logging.info(f"Done provisioning config directory ({deadline_config_subdir})")
 
+    logging.info(f"Porvisioning session root directory ({session_root_dir})")
+    os.makedirs(session_root_dir, exist_ok=True)
+    _set_windows_permissions(
+        path=session_root_dir,
+        user=agent_username,
+        user_permission=FileSystemPermissionEnum.FULL_CONTROL,
+        group="Administrators",
+        group_permission=FileSystemPermissionEnum.FULL_CONTROL,
+        agent_user_permission=None,
+        users_group_permission=FileSystemPermissionEnum.LIST_DIRECTORY_AND_READ,
+    )
+    logging.info(f"Done provisioning session root directory ({session_root_dir})")
+
     return WorkerAgentDirectories(
         deadline_dir=Path(deadline_dir),
         deadline_log_subdir=Path(deadline_log_subdir),
         deadline_persistence_subdir=Path(deadline_persistence_subdir),
         deadline_config_subdir=Path(deadline_config_subdir),
     )
-
-
-def update_deadline_client_config(
-    user: str,
-    settings: dict[str, str],
-) -> None:
-    """
-    Updates the Deadline Client config for the specified user.
-
-    Args:
-        user (str): The user to update the Deadline Client config for.
-        settings (dict[str, str]]): The key-value pairs of settings to update.
-
-    Raises:
-        InstallerFailedException: _description_
-    """
-    # Build the Deadline client config path for the user
-    deadline_client_config_path = deadline.client.config.config_file.CONFIG_FILE_PATH
-    if not deadline_client_config_path.startswith("~"):
-        raise InstallerFailedException(
-            f"Cannot opt out of telemetry: Expected Deadline client config file path to start with a tilde (~), but got: {deadline_client_config_path}\n"
-            f"This is because the Deadline client program (version {deadline.client.version}) is not compatible with this version of the Worker agent installer\n"
-            f"To opt out of telemetry, please use a compatible version of the Deadline client program or run the following command as the worker user:\n\n"
-            "deadline config set telemetry.opt_out true\n"
-        )
-    user_deadline_client_config_path = f"~{user}" + deadline_client_config_path.removeprefix("~")
-
-    # Opt out of client telemetry for the agent user
-    old_environ = os.environ.copy()
-    try:
-        os.environ[DEADLINE_CLIENT_CONFIG_PATH_OVERRIDE_ENV_VAR] = user_deadline_client_config_path
-        for setting_key, setting_value in settings.items():
-            deadline.client.config.config_file.set_setting(setting_key, setting_value)
-    except Exception as e:
-        logging.error(f"Failed to update Deadline Client configuration for user '{user}': {e}")
-        raise
-    finally:
-        os.environ.clear()
-        os.environ.update(old_environ)
 
 
 def _check_and_stop_service(service_name: str):
@@ -726,7 +704,13 @@ def get_effective_user_rights(user: str) -> set[str]:
 
     # Get SIDs of all groups the user is in
     # win32net.NetUserGetLocalGroups includes the LG_INCLUDE_INDIRECT flag by default
-    group_names = win32net.NetUserGetLocalGroups(None, user)
+    # NetUserGetLocalGroups requires DDL format (DOMAIN\user) — resolve if needed
+    resolved_user = user
+    if "@" in user:
+        resolved_user = win32security.TranslateName(
+            user, win32con.NameUserPrincipal, win32con.NameSamCompatible
+        )
+    group_names = win32net.NetUserGetLocalGroups(None, resolved_user)
     for group in group_names:
         group_sid, _, _ = win32security.LookupAccountName(None, group)
         sids_to_check.append(group_sid)
@@ -739,7 +723,7 @@ def get_effective_user_rights(user: str) -> set[str]:
             try:
                 account_rights = win32security.LsaEnumerateAccountRights(policy_handle, sid)
             except pywintypes.error as e:
-                if e.strerror == "The system cannot find the file specified.":
+                if e.winerror == winerror.ERROR_FILE_NOT_FOUND:
                     # Account is not directly assigned any rights
                     continue
                 else:
@@ -815,6 +799,7 @@ def start_windows_installer(
     region: str,
     allow_shutdown: bool,
     parser: ArgumentParser,
+    session_root_dir: Path,
     user_name: str = DEFAULT_WA_USER,
     password: Optional[str] = None,
     group_name: str = DEFAULT_JOB_GROUP,
@@ -846,16 +831,20 @@ def start_windows_installer(
         logging.error(f"Not a valid value for Fleet id: {fleet_id}")
         print_helping_info_and_exit()
 
+    is_agent_domain_user = is_domain_user(user_name)
+
     # Check that user has Administrator privileges
     if not shell.IsUserAnAdmin():
         logging.error(f"User does not have Administrator privileges: {os.environ['USERNAME']}")
         print_helping_info_and_exit()
 
+    # Validate that if a windows job user override is specified, that the user exists
     if windows_job_user is not None and not check_account_existence(windows_job_user):
         raise InstallerFailedException(
             f"Account {windows_job_user} provided for argument windows-job-user does not exist. "
             "Please create the account before proceeding."
         )
+    # Validate that if a windows job user override is specified, that it is not the same as the worker agent user
     elif windows_job_user is not None and users_equal(windows_job_user, user_name):
         raise InstallerFailedException(
             f"Argument for windows-job-user cannot be the same as the worker agent user: {user_name}. "
@@ -867,7 +856,14 @@ def start_windows_installer(
     print_banner()
 
     if not password:
-        if check_account_existence(user_name):
+        if is_agent_domain_user:
+            password = getpass("Domain agent user password: ")
+            try:
+                WindowsSessionUser(user_name, password=password)
+            except BadCredentialsException:
+                print("ERROR: Password incorrect")
+                sys.exit(1)
+        elif check_account_existence(user_name):
             password = getpass("Agent user password: ")
             try:
                 WindowsSessionUser(user_name, password=password)
@@ -884,6 +880,7 @@ def start_windows_installer(
         f"Region: {region}\n"
         f"Worker agent user: {user_name}\n"
         f"Worker job group: {group_name}\n"
+        f"Session root directory: {session_root_dir}\n"
         f"Allow worker agent shutdown: {allow_shutdown}\n"
         f"Install Windows service: {install_service}\n"
         f"Start service: {start_service}\n"
@@ -920,7 +917,15 @@ def start_windows_installer(
 
     # Check if the worker agent user exists, and create it if not
     agent_user_created = False
-    if check_account_existence(user_name):
+    if is_agent_domain_user:
+        # Domain users must already exist — verify the account is resolvable
+        if not check_account_existence(user_name):
+            raise InstallerFailedException(
+                f"Domain user '{user_name}' does not exist. "
+                "Domain users must be created in Active Directory before running the installer."
+            )
+        logging.info(f"Using existing domain user ({user_name}) as worker agent user")
+    elif check_account_existence(user_name):
         logging.info(f"Using existing user ({user_name}) as worker agent user")
 
         # This is only to verify the credentials. It will raise a BadCredentialsError if the
@@ -935,6 +940,13 @@ def start_windows_installer(
 
     if is_user_in_group("Administrators", user_name):
         logging.info(f"Agent user '{user_name}' is already an administrator")
+    elif is_agent_domain_user and not grant_required_access:
+        logging.error(
+            f"Domain user '{user_name}' is not in the Administrators group. "
+            "Please add the user to the Administrators group before running the installer, "
+            "or provide the --grant-required-access option to allow the installer to add it."
+        )
+        sys.exit(1)
     elif not agent_user_created and not grant_required_access:
         logging.error(
             f"The Worker Agent user needs to run as an administrator, but the supplied user ({user_name}) exists "
@@ -974,30 +986,32 @@ def start_windows_installer(
 
     if is_user_in_group(group_name, user_name):
         logging.info(f"Agent user '{user_name}' is already in group '{group_name}'")
+    elif is_agent_domain_user and not grant_required_access:
+        logging.error(
+            f"Domain user '{user_name}' is not in the '{group_name}' group. "
+            f"Please add the user to the '{group_name}' group, or provide the "
+            "--grant-required-access option to allow the installer to add it."
+        )
+        sys.exit(1)
     else:
         # Add the worker agent user to the job group
         add_user_to_group(group_name, user_name)
 
     # Create directories and configure their permissions
-    agent_dirs = provision_directories(user_name)
+    agent_dirs = provision_directories(agent_username=user_name, session_root_dir=session_root_dir)
     update_config_file(
-        str(agent_dirs.deadline_config_subdir),
-        farm_id,
-        fleet_id,
+        deadline_config_sub_directory=str(agent_dirs.deadline_config_subdir),
+        farm_id=farm_id,
+        fleet_id=fleet_id,
+        region=region,
         # This always sets shutdown_on_stop even if the user did not provide
         # any "shutdown" option to be consistent with POSIX installer
         shutdown_on_stop=allow_shutdown,
         allow_ec2_instance_profile=allow_ec2_instance_profile,
         windows_job_user=windows_job_user,
+        session_root_dir=session_root_dir,
+        telemetry_opt_out=telemetry_opt_out,
     )
-
-    if telemetry_opt_out:
-        logging.info("Opting out of client telemetry")
-        update_deadline_client_config(
-            user=user_name,
-            settings={"telemetry.opt_out": "true"},
-        )
-        logging.info("Opted out of client telemetry")
 
     # Install the Windows service if specified
     if install_service:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import PurePath, PurePosixPath, PureWindowsPath
-from typing import Any, cast
+from typing import Any, Callable, cast
 import os
 
 from openjd.model import (
@@ -22,22 +22,88 @@ from openjd.sessions import (
 from openjd.sessions import PathMappingRule as OPENJDPathMappingRule
 
 from ...api_models import (
+    BoolListParameter,
+    BoolParameter,
+    FloatListParameter,
     FloatParameter,
+    IntListListParameter,
+    IntListParameter,
     IntParameter,
     JobDetailsData,
     JobAttachmentQueueSettings as JobAttachmentSettingsBoto,
     JobRunAsUser as JobRunAsUserModel,
+    PathListParameter,
     PathMappingRule,
     PathParameter,
+    RangeExprParameter,
+    StringListParameter,
     StringParameter,
+    ChunkIntParameter,
 )
+from ...config import JobsRunAsUserOverride
 from .job_entity_type import JobEntityType
 from .validation import Field, validate_object
-from ...startup.config import JobsRunAsUserOverride
+
+
+# The case-insensitive boolean vocabulary the service uses for string-typed
+# boolean parameters, per the Open Job Description specification. Kept as
+# explicit frozensets (rather than a regex) so the accepted tokens stay
+# greppable and self-documenting.
+_TRUE_STRINGS = frozenset({"true", "yes", "on", "1", "1.0"})
+_FALSE_STRINGS = frozenset({"false", "no", "off", "0", "0.0"})
+
+
+def _bool_from_api_response(name: str, value: object) -> bool:
+    """Coerce a wire-format boolean parameter value into a native Python bool.
+
+    The service transmits boolean job parameters as constrained strings drawn
+    from Open Job Description's case-insensitive boolean vocabulary, but jobs
+    created before that change are persisted with -- and echoed back as --
+    native JSON booleans, so either form may arrive. Open Job Description's
+    typed parameter handling expects a native Python bool at this boundary, so
+    both forms are normalized here.
+
+    A native bool passes through unchanged. A string is matched
+    case-insensitively against the accepted vocabulary. Any other value --
+    including an unrecognized string, a string with surrounding whitespace, or
+    a non-str, non-bool type such as the native int 0 or 1 -- raises ValueError.
+    """
+    # bool is a subclass of int, so match a native bool first and pass it
+    # through unchanged. The string membership tests below then reject ints
+    # such as 0/1 because the vocabulary frozensets hold only str tokens.
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    raise ValueError(
+        f"Job parameter {name!r} has an invalid boolean value {value!r}; expected "
+        f"True, False, or one of the case-insensitive strings "
+        f"{sorted(_TRUE_STRINGS | _FALSE_STRINGS)}."
+    )
 
 
 def parameters_from_api_response(
-    params: dict[str, StringParameter | PathParameter | IntParameter | FloatParameter | str]
+    params: dict[
+        str,
+        StringParameter
+        | PathParameter
+        | IntParameter
+        | FloatParameter
+        | ChunkIntParameter
+        | BoolParameter
+        | RangeExprParameter
+        | StringListParameter
+        | PathListParameter
+        | IntListParameter
+        | FloatListParameter
+        | BoolListParameter
+        | IntListListParameter
+        | str,
+    ],
 ) -> dict[str, ParameterValue]:
     result = dict[str, ParameterValue]()
     for name, value in params.items():
@@ -53,6 +119,53 @@ def parameters_from_api_response(
         elif "path" in value:
             value = cast(PathParameter, value)
             param_value = ParameterValue(type=ParameterValueType.PATH, value=value["path"])
+        elif "chunkInt" in value:
+            value = cast(ChunkIntParameter, value)
+            param_value = ParameterValue(type=ParameterValueType.CHUNK_INT, value=value["chunkInt"])
+        elif "bool" in value:
+            value = cast(BoolParameter, value)
+            param_value = ParameterValue(
+                type=ParameterValueType.BOOL,
+                value=_bool_from_api_response(name, value["bool"]),
+            )
+        elif "rangeExpr" in value:
+            value = cast(RangeExprParameter, value)
+            param_value = ParameterValue(
+                type=ParameterValueType.RANGE_EXPR, value=value["rangeExpr"]
+            )
+        elif "stringList" in value:
+            value = cast(StringListParameter, value)
+            param_value = ParameterValue(
+                type=ParameterValueType.LIST_STRING, value=value["stringList"]
+            )
+        elif "pathList" in value:
+            value = cast(PathListParameter, value)
+            param_value = ParameterValue(type=ParameterValueType.LIST_PATH, value=value["pathList"])
+        elif "intList" in value:
+            value = cast(IntListParameter, value)
+            param_value = ParameterValue(type=ParameterValueType.LIST_INT, value=value["intList"])
+        elif "floatList" in value:
+            value = cast(FloatListParameter, value)
+            param_value = ParameterValue(
+                type=ParameterValueType.LIST_FLOAT, value=value["floatList"]
+            )
+        elif "boolList" in value:
+            value = cast(BoolListParameter, value)
+            bool_list = value["boolList"]
+            if not isinstance(bool_list, list):
+                raise ValueError(
+                    f"Job parameter {name!r} has an invalid boolList value {bool_list!r}; "
+                    f"expected a list."
+                )
+            param_value = ParameterValue(
+                type=ParameterValueType.LIST_BOOL,
+                value=[_bool_from_api_response(name, item) for item in bool_list],
+            )
+        elif "intListList" in value:
+            value = cast(IntListListParameter, value)
+            param_value = ParameterValue(
+                type=ParameterValueType.LIST_LIST_INT, value=value["intListList"]
+            )
         else:
             raise ValueError(f"Parameter {name} -- unknown form in API response: {str(value)}")
         result[name] = param_value
@@ -219,6 +332,13 @@ class JobDetails:
     queue_role_arn: str | None = None
     """The ARN of the Job's Queue Role, if it has one."""
 
+    extensions: list[str] | None = None
+    """The OpenJD extensions the job declared, as served by BatchGetJobEntity.
+
+    None means the response omitted the field; see session_extensions() for how
+    that differs from an empty list.
+    """
+
     @classmethod
     def from_boto(cls, job_details_data: JobDetailsData) -> JobDetails:
         """Parses the data returned in the BatchGetJobEntity response
@@ -270,6 +390,7 @@ class JobDetails:
             path_mapping_rules=path_mapping_rules,
             job_attachment_settings=job_attachment_settings,
             queue_role_arn=queue_role_arn,
+            extensions=job_details_data.get("extensions", None),
         )
 
     @classmethod
@@ -351,6 +472,7 @@ class JobDetails:
                     ),
                 ),
                 Field(key="queueRoleArn", expected_type=str, required=False),
+                Field(key="extensions", expected_type=list, required=False),
             ),
         )
 
@@ -425,6 +547,33 @@ class JobDetails:
 
     @classmethod
     def _validate_job_parameters(cls, job_parameters: dict[str, Any]) -> None:
+        # Maps each accepted wire-format type key to a predicate that checks the
+        # value has the shape the service sends for that type.
+        def _is_str_list(value: Any) -> bool:
+            return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+        value_shape_checks: dict[str, Callable[[Any], bool]] = {
+            "string": lambda v: isinstance(v, str),
+            "path": lambda v: isinstance(v, str),
+            "int": lambda v: isinstance(v, str),
+            "float": lambda v: isinstance(v, str),
+            "chunkInt": lambda v: isinstance(v, str),
+            # The shape layer accepts both the string wire form (the service's
+            # constrained boolean vocabulary) and a native bool (pre-change
+            # jobs); the value vocabulary itself is enforced at decode time by
+            # _bool_from_api_response.
+            "bool": lambda v: isinstance(v, (str, bool)),
+            "rangeExpr": lambda v: isinstance(v, str),
+            "stringList": _is_str_list,
+            "pathList": _is_str_list,
+            "intList": _is_str_list,
+            "floatList": _is_str_list,
+            "boolList": lambda v: (
+                isinstance(v, list) and all(isinstance(item, (str, bool)) for item in v)
+            ),
+            "intListList": lambda v: isinstance(v, list) and all(_is_str_list(item) for item in v),
+        }
+
         for key, value in job_parameters.items():
             if not isinstance(value, dict):
                 raise ValueError(f'Expected parameters["{key}"] to be a dict but got {type(value)}')
@@ -436,12 +585,13 @@ class JobDetails:
                     f'Expected parameters["{key}"] to have a single key, but got {keys_str}'
                 )
             type_key = list(value.keys())[0]
-            if type_key not in ("string", "path", "int", "float"):
+            if type_key not in value_shape_checks:
+                expected_keys = ", ".join(f'"{k}"' for k in value_shape_checks)
                 raise ValueError(
-                    f'Expected parameters["{key}"] to have a single key with one of "string", "path", "int", "float" but got "{type_key}"'
+                    f'Expected parameters["{key}"] to have a single key with one of {expected_keys} but got "{type_key}"'
                 )
             param_value = list(value.values())[0]
-            if not isinstance(param_value, str):
+            if not value_shape_checks[type_key](param_value):
                 raise ValueError(
-                    f'Expected parameters["{key}"] to have a single a single key whose value is a string but the value was {type(param_value)}'
+                    f'Value of parameters["{key}"] does not match the expected shape for its type "{type_key}"'
                 )

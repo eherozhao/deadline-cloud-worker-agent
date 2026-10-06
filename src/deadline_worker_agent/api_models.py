@@ -35,6 +35,14 @@ __all__ = [
     "StepDetailsError",
     "StepDetailsIdentifier",
     "StringParameter",
+    "BoolParameter",
+    "BoolListParameter",
+    "FloatListParameter",
+    "IntListParameter",
+    "IntListListParameter",
+    "PathListParameter",
+    "RangeExprParameter",
+    "StringListParameter",
     "TaskRunAction",
     "UpdatedSessionActionInfo",
     "UpdatedSessionActionInfo",
@@ -45,7 +53,8 @@ __all__ = [
 
 EnvironmentActionType = Literal["ENV_ENTER", "ENV_EXIT"]
 StepActionType = Literal["TASK_RUN"]  # noqa
-SyncInputJobAttachmentsActionType = Literal["SYNC_INPUT_JOB_ATTACHMENTS"]  # noqa
+AttachmentDownloadActionType = Literal["SYNC_INPUT_JOB_ATTACHMENTS"]  # noqa
+AttachmentUploadActionType = Literal["SYNC_OUTPUT_JOB_ATTACHMENTS"]  # noqa
 CompletedActionStatus = Literal["SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELED", "NEVER_ATTEMPTED"]
 
 
@@ -71,20 +80,92 @@ class FloatParameter(TypedDict):
     float: str
 
 
+class ChunkIntParameter(TypedDict):
+    chunkInt: str
+
+
+class BoolParameter(TypedDict):
+    # The service transmits booleans as constrained strings; native booleans
+    # may still be seen for jobs created before that change.
+    bool: str | bool
+
+
+class RangeExprParameter(TypedDict):
+    rangeExpr: str
+
+
+class StringListParameter(TypedDict):
+    stringList: list[str]
+
+
+class PathListParameter(TypedDict):
+    pathList: list[str]
+
+
+class IntListParameter(TypedDict):
+    intList: list[str]
+
+
+class FloatListParameter(TypedDict):
+    floatList: list[str]
+
+
+class BoolListParameter(TypedDict):
+    # The service transmits booleans as constrained strings; native booleans
+    # may still be seen for jobs created before that change.
+    boolList: list[str | bool]
+
+
+class IntListListParameter(TypedDict):
+    intListList: list[list[str]]
+
+
 class TaskRunAction(TypedDict):
     sessionActionId: str
     actionType: StepActionType
-    taskId: str
+    taskId: NotRequired[str]
     stepId: str
     parameters: NotRequired[
-        dict[str, StringParameter | PathParameter | IntParameter | FloatParameter]
+        dict[
+            str,
+            StringParameter
+            | PathParameter
+            | IntParameter
+            | FloatParameter
+            | ChunkIntParameter
+            | BoolParameter
+            | RangeExprParameter
+            | StringListParameter
+            | PathListParameter
+            | IntListParameter
+            | FloatListParameter
+            | BoolListParameter
+            | IntListListParameter,
+        ]
     ]
 
 
-class SyncInputJobAttachmentsAction(TypedDict):
+class AttachmentDownloadAction(TypedDict):
     sessionActionId: str
-    actionType: SyncInputJobAttachmentsActionType
+    actionType: AttachmentDownloadActionType
     stepId: NotRequired[str]
+
+
+# This action is not from API, kepping it here for all action models to be in one place
+class AttachmentUploadAction(TypedDict):
+    sessionActionId: str
+    actionType: AttachmentUploadActionType
+    stepId: str
+    taskId: NotRequired[str]
+    startTime: float
+
+
+class HostConfiguration(TypedDict):
+    scriptBody: str
+    """Host Configuration Script Body."""
+
+    scriptTimeoutSeconds: int
+    """Customer Supplied timeout."""
 
 
 class LogConfiguration(TypedDict):
@@ -97,8 +178,9 @@ class LogConfiguration(TypedDict):
 class AssignedSession(TypedDict):
     queueId: str
     jobId: str
-    sessionActions: list[EnvironmentAction | TaskRunAction | SyncInputJobAttachmentsAction]
+    sessionActions: list[EnvironmentAction | TaskRunAction | AttachmentDownloadAction]
     logConfiguration: NotRequired[LogConfiguration]
+    metadata: NotRequired[dict[str, str]]
 
 
 class UpdateWorkerScheduleResponse(TypedDict):
@@ -139,6 +221,12 @@ class StepDetailsData(StepDetailsIdentifierFields):
 
     dependencies: NotRequired[list[str]]
     """A list of step identifiers that this step depends on"""
+
+    resolvedSymbolTable: NotRequired[str]
+    """Pre-resolved symbol table as a JSON string, forwarded to the Rust session runtime."""
+
+    extensions: NotRequired[list[str]]
+    """The extensions enabled for the job, as supplied by the service"""
 
 
 class StepDetails(TypedDict):
@@ -270,7 +358,23 @@ class JobDetailsData(JobDetailsIdentifierFields):
     """The Open Job Description job template schema version"""
 
     parameters: NotRequired[
-        dict[str, StringParameter | PathParameter | IntParameter | FloatParameter | str]
+        dict[
+            str,
+            StringParameter
+            | PathParameter
+            | IntParameter
+            | FloatParameter
+            | ChunkIntParameter
+            | BoolParameter
+            | RangeExprParameter
+            | StringListParameter
+            | PathListParameter
+            | IntListParameter
+            | FloatListParameter
+            | BoolListParameter
+            | IntListListParameter
+            | str,
+        ]
     ]
     """The job parameters"""
 
@@ -279,6 +383,9 @@ class JobDetailsData(JobDetailsIdentifierFields):
 
     queueRoleArn: NotRequired[str]
     """An optional IAM role ARN corresponding used for worker sessions on the job's queue"""
+
+    extensions: NotRequired[list[str]]
+    """The extensions enabled for the job, as supplied by the service"""
 
 
 class JobDetails(TypedDict):
@@ -301,6 +408,10 @@ class EnvironmentDetailsData(EnvironmentDetailsIdentifierFields):
     """The Open Job Description schema version"""
     template: dict[str, Any]
     """The template of the environment."""
+    resolvedSymbolTable: NotRequired[str]
+    """Pre-resolved symbol table as a JSON string, forwarded to the Rust session runtime."""
+    extensions: NotRequired[list[str]]
+    """The extensions enabled for the job, as supplied by the service"""
 
 
 class EnvironmentDetails(TypedDict):
@@ -376,6 +487,13 @@ class BatchGetJobEntityResponse(TypedDict):
     errors: list[EntityError]
 
 
+class ManifestInfo(TypedDict):
+    """Model for manifest information."""
+
+    outputManifestPath: NotRequired[str]
+    outputManifestHash: NotRequired[str]
+
+
 class UpdatedSessionActionInfo(TypedDict):
     completedStatus: NotRequired[CompletedActionStatus]
     processExitCode: NotRequired[int]
@@ -384,6 +502,7 @@ class UpdatedSessionActionInfo(TypedDict):
     endedAt: NotRequired[datetime]
     updatedAt: NotRequired[datetime]
     progressPercent: NotRequired[float]
+    manifests: NotRequired[list[ManifestInfo]]
 
 
 class UpdateWorkerScheduleRequest(TypedDict):
@@ -396,6 +515,7 @@ class UpdateWorkerScheduleRequest(TypedDict):
 
 class UpdateWorkerResponse(TypedDict):
     log: NotRequired[LogConfiguration]
+    hostConfiguration: NotRequired[HostConfiguration]
 
 
 class IpAddresses(TypedDict):

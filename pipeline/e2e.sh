@@ -3,7 +3,7 @@
 set -e
 
 pip install --upgrade pip
-pip install --upgrade hatch
+pip install --upgrade hatch "virtualenv<21"
 
 if [ "$TEST_TYPE" ]
 then
@@ -16,4 +16,4 @@ then
   fi
 fi
 
-hatch run e2e-test
+hatch run e2e:test

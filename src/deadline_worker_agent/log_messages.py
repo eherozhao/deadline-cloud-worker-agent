@@ -5,7 +5,7 @@ import sys
 from enum import Enum
 import logging
 import json
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, TYPE_CHECKING
 from types import MethodType
 from pathlib import Path
 from getpass import getuser
@@ -13,7 +13,12 @@ from getpass import getuser
 from ._version import __version__
 from openjd.model import version as openjd_model_version
 from openjd.sessions import version as openjd_sessions_version
+from openjd.sessions import LogContent
+from openjd.sessions import LOG as openjd_logger
 from deadline.job_attachments import version as deadline_job_attach_version
+
+if TYPE_CHECKING:
+    from .scheduler.scheduler import SessionMap
 
 # ========================
 #  Generic types of log messages
@@ -159,6 +164,7 @@ class WorkerLogEventOp(str, Enum):
     ID = "ID"  # The ID that the Agent is running as
     STATUS = "Status"
     DELETE = "Delete"
+    HOST_CONFIGURATION = "HostConfiguration"
 
 
 class WorkerLogEvent(BaseLogEvent):
@@ -194,6 +200,110 @@ class WorkerLogEvent(BaseLogEvent):
         if self.worker_id:
             dd.update(worker_id=self.worker_id)
         return self.add_exception_to_dict(dd)
+
+
+class WorkerHostConfigurationStatus(str, Enum):
+    RUNNING = "Running"
+    SUCCEEDED = "Succeeded"
+    FAILED = "Failed"
+    SKIPPED = "Skipped"
+
+
+class WorkerHostConfigurationLogEvent(WorkerLogEvent):
+    ti = "📜"
+    type = "Worker"
+    status: WorkerHostConfigurationStatus
+    exit_code: Optional[int]
+    success: Optional[bool]
+
+    def __init__(
+        self,
+        *,
+        farm_id: str,
+        fleet_id: str,
+        message: str,
+        status: WorkerHostConfigurationStatus,
+        worker_id: Optional[str] = None,
+        exit_code: Optional[int] = None,
+        success: Optional[bool] = None,
+    ) -> None:
+        self.exit_code = exit_code
+        self.success = success
+        self.status = status
+
+        super().__init__(
+            op=WorkerLogEventOp.HOST_CONFIGURATION,
+            farm_id=farm_id,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+            message=message,
+        )
+
+    def asdict(self) -> dict[str, str]:
+        dd = super().asdict()
+        # WorkerLogEvent.asdict() has already appended `exception`, but the schema puts
+        # `exception` last and the fields below have to precede it. dict.update() on an
+        # existing key keeps its original position, so it is lifted out and re-added.
+        exception = dd.pop("exception", None)
+        dd.update(status=self.status)
+        # Compared against None rather than truth-tested: exit_code 0 is the success
+        # case and success=False is the failure case, so a truth test drops exactly
+        # the values a consumer most needs.
+        if self.exit_code is not None:
+            dd.update(exit_code=self.exit_code)
+        if self.success is not None:
+            dd.update(success=self.success)
+        if exception is not None:
+            dd.update(exception=exception)
+        return dd
+
+
+class WorkerHostConfigurationOutputLogEvent(WorkerLogEvent):
+    """A single line of output from a host configuration script, or from the runner
+    that invokes it.
+
+    Shares the Worker/HostConfiguration subtype with the status transitions, so one
+    filter selects everything host configuration produced. A consumer that needs to
+    tell the two apart can do so by the presence of `status`, which only the
+    transitions carry.
+
+    A separate class rather than a status-less variant of
+    WorkerHostConfigurationLogEvent, so that neither has optional fields the other
+    always sets: an output line is verbatim script output and has no outcome to
+    report. stdout and stderr are merged by the time they arrive here, so the
+    originating stream is not recoverable and is not reported.
+
+    Without this, output lines reach the logger as plain strings and
+    LogRecordStringTranslationFilter turns them into untyped StringLogEvents, which
+    carry no type, subtype, or resource ids and so can be neither filtered nor
+    attributed to the worker that produced them.
+    """
+
+    ti = "📜"
+
+    def __init__(
+        self,
+        *,
+        farm_id: str,
+        fleet_id: str,
+        message: str,
+        worker_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            op=WorkerLogEventOp.HOST_CONFIGURATION,
+            farm_id=farm_id,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+            message=message,
+        )
+
+    def getMessage(self) -> str:
+        # Deliberately not WorkerLogEvent.getMessage(), which appends
+        # "[farm/fleet/worker]" to the message. That is reasonable for the handful of
+        # lifecycle events but would repeat the same ids on every line of script
+        # output in the plain-text log. The ids remain in asdict() for the
+        # structured log.
+        return self.add_exception_to_message(self.msg)
 
 
 class FilesystemLogEventOp(str, Enum):
@@ -386,6 +496,7 @@ class SessionLogEventSubtype(str, Enum):
     COMPLETE = "Complete"
     INFO = "Info"  # Generic information about the session
     LOGS = "Logs"  # Info on where the logs are going
+    RUNTIME = "Runtime"  # Runtime logs from the openjd.sessions module applicable to the worker log
 
 
 class SessionLogEvent(BaseLogEvent):
@@ -435,6 +546,7 @@ class SessionLogEvent(BaseLogEvent):
             fmt_str = "[%(session_id)s] %(message)s (LogDestination: %(log_dest)s) [%(queue_id)s/%(job_id)s]"
         else:
             fmt_str = "[%(session_id)s] %(message)s [%(queue_id)s/%(job_id)s]"
+
         return self.add_exception_to_message(fmt_str % dd)
 
     def asdict(self) -> dict[str, Any]:
@@ -466,7 +578,8 @@ class SessionActionLogKind(str, Enum):
     ENV_ENTER = "EnvEnter"
     ENV_EXIT = "EnvExit"
     TASK_RUN = "TaskRun"
-    JA_SYNC = "JobAttachSyncInput"
+    JA_SYNC_INPUT = "JobAttachSyncInput"
+    JA_SYNC_OUTPUT = "JobAttachSyncOutput"
     JA_DEP_SYNC = "JobAttachSyncDeps"
 
 
@@ -570,15 +683,90 @@ class LogRecordStringTranslationFilter(logging.Filter):
     """
 
     formatter = logging.Formatter()
+    openjd_worker_log_content = (
+        LogContent.EXCEPTION_INFO | LogContent.PROCESS_CONTROL | LogContent.HOST_INFO
+    )
+    _session_map: "SessionMap" | None = None
+
+    @property
+    def session_map(self) -> Optional["SessionMap"]:
+        if self._session_map is None:
+            from .scheduler.scheduler import SessionMap
+
+            self._session_map = SessionMap.get_session_map()
+        return self._session_map
+
+    def _is_from_openjd(self, record: logging.LogRecord) -> bool:
+        """Returns True if the record is from openjd.sessions"""
+        return record.name == openjd_logger.name and isinstance(record.msg, str)
+
+    def _is_openjd_message_to_log(self, record: logging.LogRecord) -> bool:
+        """
+        Return True if the record is from openjd.sessions and has content that should be logged in the worker logs.
+        """
+        if not self._is_from_openjd(record):
+            return False
+        if not hasattr(record, "openjd_log_content") or not isinstance(
+            record.openjd_log_content, LogContent
+        ):
+            # Message from openjd.sessions does not have the openjd_log_content property, so we
+            # do not know what content the message contains. Do not log.
+            return False
+        elif record.openjd_log_content not in self.openjd_worker_log_content:
+            # Message contains content that does not belong in the worker logs. Do not log.
+            return False
+        else:
+            return True
+
+    def _replace_openjd_log_message(self, record: logging.LogRecord) -> None:
+        """
+        Best effort replaces the .msg attribute of a LogRecord from openjd.sessions with a SessionLogEvent.
+        If the record does not have a session_id attribute, then the .msg attribute is not replaced.
+        """
+        if not hasattr(record, "session_id") or not isinstance(record.session_id, str):
+            # This should never happen. If somehow it does, just fall back to a StringLogEvent.
+            record.msg += " The Worker Agent could not determine the session ID of this log originating from OpenJD. Please report this to the service team."
+            return
+
+        session_id = record.session_id
+        queue_id = None
+        job_id = None
+
+        if self.session_map is not None and session_id in self.session_map:
+            scheduler_session = self.session_map[session_id]
+            queue_id = scheduler_session.session._queue_id
+            job_id = scheduler_session.session._job_id
+            record.msg = SessionLogEvent(
+                subtype=SessionLogEventSubtype.RUNTIME,
+                queue_id=queue_id,
+                job_id=job_id,
+                session_id=session_id,
+                message=record.getMessage(),
+                user=None,  # User is only used for SessionLogEventSubtype.USER
+            )
+        else:
+            # This can happen at the very beginning of a session. Fall back to a StringLogEvent.
+            return
+        record.getMessageReplaced = True
+        record.getMessage = MethodType(lambda self: self.msg.getMessage(), record)  # type: ignore
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Translate plain string log messages into a LogMessage instance
         based on the loglevel of the record.
         Log records don't have a str typed msg pass-through as-is.
         """
+        if self._is_from_openjd(record):
+            if self._is_openjd_message_to_log(record):
+                # Message is from openjd.sessions and only contains content we intend to log in the worker logs.
+                self._replace_openjd_log_message(record)
+            else:
+                return False
+
         if isinstance(record.msg, str):
             message = record.getMessage()
             record.msg = StringLogEvent(message)
+            # We must replace record.getMessage() so that a string is returned and not the LogEvent type.
+            # getMessageReplaced is used to indicate we already have done so, to avoid replacing twice.
             record.getMessageReplaced = True
             record.getMessage = MethodType(lambda self: self.msg.getMessage(), record)  # type: ignore
             record.args = None

@@ -4,49 +4,7 @@ This documentation provides guidance on developer workflows for working with the
 
 ## Code Organization
 
-### `src/deadline_worker_agent`
-
-This is the root of the source code. The primary code files where most of the changes would be made exist in this root directory.
-
-Files of note include:
-
-*   `worker.py`
-
-    `Worker` class implementation containing the main thread's event loop that runs after the Worker has been bootstrapped. This is the original implementation of the Worker Agent that uses `UpdateWorkerSchedule` and `NotifyProgress` which are APIs that are unaware of Worker Sessions.
-
-## `src/deadline_worker_agent/boto`
-
-This contains logic for boto3 and botocore.
-
-### `src/deadline_worker_agent/startup`
-
-This contains logic for the startup phase in the Worker Agent's lifecycle.
-
-### `src/deadline_worker_agent/log_sync`
-
-This Python sub-package contains code responsible for synchronizing logs emitted by AWS Deadline Cloud tasks to their destination(s) in S3 and CloudWatch Logs, and synchronizing logs emitted by agent to CloudWatch Logs.
-
-### `src/deadline_worker_agent/scheduler`
-
-This contains an impementation of the Worker Agent's scheduler. This works with the AWS Deadline Cloud farm's scheduler via `UpdateWorkerSchedule` to synchronize the assignment, completion, and status reporting of work.
-
-### `src/deadline_worker_agent/sessions`
-
-This contains the logic and APIs for managing the life-cycle of a Worker session. The primary class contained in this package, the `Session` class, is responsible for taking actions from the `SessionActionQueue` and running them within the Open Job Description session.
-
-### `src/deadline_worker_agent/sessions/actions`
-
-This package contains classes corresponding to each action and the logic for running them within the `Session`.
-
-### `src/deadline_worker_agent/sessions/job_entities`
-
-This package contains code responsible for fetching the job entities required for running Worker session actions. This coordinates efficient use of the `BatchGetJobEntity` API and provides a high-level API for asynchronously requesting (optionally in a batch) and waiting for fetched the entities.
-
-### `src/deadline_worker_agent/installer`
-
-This contains the logic for the `install_deadline_worker` entrypoint which provisions OS users, groups, sudoers rule, and file-system
-directories used by the Worker Agent. Finally it configures a systemd service on Linux systems that runs the Worker Agent
-on boot and restarts the process if it crashes unexpectedly.
+See [code organization](./docs/dev/architecture.md#3-code-organization).
 
 ## Build / Test
 
@@ -128,19 +86,35 @@ To stop the agent, simply run:
 docker exec test_worker_agent /home/agentuser/term_agent.sh
 ```
 
+### Running Worker Agent Integration Tests
+
+The worker agent has integration tests that run locally on the host machine they are run from.
+These tests cover integration with the host operating system and file-system. If you are making
+changes that apply to both Windows and Linux, you will need to test your changes on both a Linux
+host and a Windows host.
+
+To run the tests, run:
+
+```sh
+hatch run integ-test
+```
+
 ### Running Worker Agent E2E Tests
 
 The worker agent has end-to-end tests that run the agent on ec2 instances with the live Deadline Cloud service. These tests
 are located under `test/e2e` in this repository. To run these tests:
 
 1. Configure your AWS credentials profile & region to test within. (e.g. Set the env vars `AWS_PROFILE` and `AWS_DEFAULT_REGION`)
-2. Deploy the testing infrastructure: Run `scripts/deploy_e2e_testing_infrastructure.sh`
-3. Gather the environment variable exports that you will need for each OS:
+2. Deploy https://github.com/aws-cloudformation/community-registry-extensions/blob/main/resources/S3_DeleteBucketContents/resource-role-prod.yaml to your account. Note down the output role ARN.
+3. Goto `AWS Console -> CloudFormation -> Public Extensions -> Search for Third Party Resource: 'AwsCommunity::S3::DeleteBucketContents' -> Activate`. Use the role ARN from step 2.
+4. Before deploying the test farm, make sure your account has sufficient Farm quota. Each account has a limit of 2.
+5. Deploy the testing infrastructure: Run `scripts/deploy_e2e_testing_infrastructure.sh`
+6. Gather the environment variable exports that you will need for each OS:
 ```bash
 ./scripts/get_e2e_test_ids_from_cfn.sh --os Linux > .e2e_linux_infra.sh
 ./scripts/get_e2e_test_ids_from_cfn.sh --os Windows > .e2e_windows_infra.sh
 ```
-4. Run the tests:
+7. Run the tests:
 ```
 rm -f dist/*
 hatch build
@@ -148,9 +122,34 @@ export WORKER_AGENT_WHL_PATH=$(pwd)/$(ls dist/*.whl)
 
 # Linux
 source .e2e_linux_infra.sh
-hatch run e2e-test
+hatch run e2e:test
 
 # Windows
 source .e2e_windows_infra.sh
-hatch run e2e-test
+hatch run e2e:test
 ```
+
+To run the entire e2e suite pinned to the Rust session runtime:
+```
+hatch run e2e:test-rust
+```
+
+The `--session-runtime` pytest option (and `WORKER_AGENT_SESSION_RUNTIME` env var) also accept
+`python` and `service-selected` for other runtime configurations.
+
+You can also override the `openjd-sessions` and/or `deadline-cloud` packages installed on the worker
+by pointing to local wheel files. This is useful when testing against unreleased or locally-built versions.
+Both variables accept a path (glob patterns are supported, but must resolve to exactly one file).
+
+```
+export OPENJD_SESSIONS_WHL_PATH=/path/to/openjd_sessions-*.whl
+export DEADLINE_WHL_PATH=/path/to/deadline_cloud-*.whl
+```
+
+#### Debugging Pytest Hanging
+
+Sometimes you may encounter an issue where the tests complete, but pytest hangs and does not exit.
+This could happen if the test code or the code-under-test creates a Python thread that does not exit.
+There are two pytest hooks `pytest_unconfigure` and `pytest_sessionfinish` that have been
+instrumented with debug tooling for this situation. To use this, set the `DEBUG_THREAD_STACKS`
+environment variable before running the end-to-end tests.

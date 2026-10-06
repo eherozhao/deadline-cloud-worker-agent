@@ -19,14 +19,16 @@ from pathlib import Path
 import boto3
 import requests
 
+from .aws_credentials import WorkerBoto3Session, AwsCredentialsRefresher
 from .boto import DeadlineClient
+from .config import JobsRunAsUserOverride
+from ._session_runtime_kind import SessionRuntimeKind
 from .errors import ServiceShutdown
+from .log_messages import AwsCredentialsLogEvent, AwsCredentialsLogEventOp
 from .metrics import HostMetricsLogger
 from .scheduler import WorkerScheduler
 from .sessions import Session
-from .startup.config import JobsRunAsUserOverride
-from .aws_credentials import WorkerBoto3Session, AwsCredentialsRefresher
-from .log_messages import AwsCredentialsLogEvent, AwsCredentialsLogEventOp
+
 
 logger = getLogger(__name__)
 
@@ -88,15 +90,20 @@ class Worker:
         cleanup_session_user_processes: bool,
         worker_persistence_dir: Path,
         worker_logs_dir: Path | None,
+        session_root_dir: Path,
         host_metrics_logging: bool,
         host_metrics_logging_interval_seconds: float | None = None,
         retain_session_dir: bool = False,
+        session_runtime_kind: SessionRuntimeKind = SessionRuntimeKind.PYTHON,
         stop: Event | None = None,
     ) -> None:
         self._deadline_client = deadline_client
         self._s3_client = s3_client
         self._logs_client = logs_client
-        self._executor = ThreadPoolExecutor(max_workers=3)
+        self._executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="Worker",
+        )
         self._farm_id = farm_id
         self._fleet_id = fleet_id
         self._worker_id = worker_id
@@ -111,7 +118,9 @@ class Worker:
             worker_persistence_dir=worker_persistence_dir,
             worker_logs_dir=worker_logs_dir,
             retain_session_dir=retain_session_dir,
+            session_runtime_kind=session_runtime_kind,
             stop=stop,
+            session_root_dir=session_root_dir,
         )
         self._stop = stop or Event()
         self._boto_session = boto_session
@@ -119,9 +128,9 @@ class Worker:
         self._retain_session_dir = retain_session_dir
 
         if host_metrics_logging:
-            assert (
-                host_metrics_logging_interval_seconds is not None
-            ), "host_metrics_logging_interval_seconds is required if host metrics logging is enabled"
+            assert host_metrics_logging_interval_seconds is not None, (
+                "host_metrics_logging_interval_seconds is required if host metrics logging is enabled"
+            )
             self._host_metrics_logger = HostMetricsLogger(
                 logger=logger, interval_s=host_metrics_logging_interval_seconds
             )
@@ -132,7 +141,7 @@ class Worker:
             # TODO: Remove this once WA is stable or put behind a debug flag
             signal.signal(signal.SIGUSR1, self._output_thread_stacks)  # type: ignore
         elif os.name == "nt":
-            from .windows.win_service import is_windows_session_zero
+            from .windows.win_session import is_windows_session_zero
 
             # If we are in session 0, we are running as a Windows Service using pywin32
             # pywin32's pythonservice.exe owns the main thread and the Python application

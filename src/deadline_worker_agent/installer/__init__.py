@@ -10,13 +10,23 @@ import requests
 import sys
 import sysconfig
 
+from deadline_worker_agent.config.settings import (
+    DEFAULT_MACOS_SESSION_ROOT_DIR,
+    DEFAULT_POSIX_SESSION_ROOT_DIR,
+    DEFAULT_WINDOWS_SESSION_ROOT_DIR,
+)
+
 
 if sys.platform == "win32":
-    from deadline_worker_agent.installer.win_installer import start_windows_installer
+    from deadline_worker_agent.installer.win_installer import (
+        start_windows_installer,
+        InstallerFailedException,
+    )
 
 
 INSTALLER_PATH = {
     "linux": Path(__file__).parent / "install.sh",
+    "darwin": Path(__file__).parent / "install_macos.sh",
 }
 
 
@@ -62,13 +72,19 @@ def _get_ec2_region() -> Optional[str]:
 def install() -> None:
     """Installer entrypoint for the AWS Deadline Cloud Worker Agent"""
 
-    if sys.platform not in ["linux", "win32"]:
+    if sys.platform not in ["linux", "darwin", "win32"]:
         print(f"ERROR: Unsupported platform {sys.platform}")
         sys.exit(1)
 
     arg_parser = get_argument_parser()
-    args = arg_parser.parse_args(namespace=ParsedCommandLineArguments)
+    args = arg_parser.parse_args(namespace=ParsedCommandLineArguments())
     scripts_path = Path(sysconfig.get_path("scripts"))
+
+    # The Deadline Virtual File System (VFS) is not supported on macOS. Reject the option here
+    # so the error surfaces before we shell out to install_macos.sh (which also rejects it).
+    if sys.platform == "darwin" and args.vfs_install_path:
+        print("ERROR: --vfs-install-path is not supported on macOS.")
+        sys.exit(1)
 
     if args.region is None:
         args.region = _get_ec2_region()
@@ -88,6 +104,7 @@ def install() -> None:
             parser=arg_parser,
             grant_required_access=args.grant_required_access,
             allow_ec2_instance_profile=not args.disallow_instance_profile,
+            session_root_dir=args.session_root_dir,
         )
         if args.user:
             installer_args.update(user_name=args.user)
@@ -100,7 +117,11 @@ def install() -> None:
         if args.windows_job_user:
             installer_args.update(windows_job_user=args.windows_job_user)
 
-        start_windows_installer(**installer_args)
+        try:
+            start_windows_installer(**installer_args)
+        except InstallerFailedException as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
     else:
         cmd = [
             "sudo",
@@ -115,6 +136,10 @@ def install() -> None:
             args.user,
             "--scripts-path",
             str(scripts_path),
+            "--python-interpreter-path",
+            sys.executable,
+            "--session-root-dir",
+            str(args.session_root_dir),
         ]
         if args.vfs_install_path:
             cmd += ["--vfs-install-path", args.vfs_install_path]
@@ -160,6 +185,7 @@ class ParsedCommandLineArguments(Namespace):
     grant_required_access: bool
     disallow_instance_profile: bool
     windows_job_user: Optional[str] = None
+    session_root_dir: Path
 
 
 def get_argument_parser() -> ArgumentParser:  # pragma: no cover
@@ -249,6 +275,20 @@ def get_argument_parser() -> ArgumentParser:  # pragma: no cover
         ),
         action="store_true",
         default=False,
+    )
+    parser.add_argument(
+        "--session-root-dir",
+        help="The root directory under which the worker agent creates session directories",
+        type=Path,
+        default=(
+            str(DEFAULT_WINDOWS_SESSION_ROOT_DIR)
+            if sys.platform == "win32"
+            else (
+                str(DEFAULT_MACOS_SESSION_ROOT_DIR)
+                if sys.platform == "darwin"
+                else str(DEFAULT_POSIX_SESSION_ROOT_DIR)
+            )
+        ),  # pragma: nocover
     )
 
     if sys.platform == "win32":

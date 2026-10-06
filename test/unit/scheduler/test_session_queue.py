@@ -20,6 +20,7 @@ from openjd.model.v2023_09 import (
     StepScript,
     StepActions,
     StepTemplate,
+    CommandString,
 )
 import pytest
 
@@ -27,21 +28,23 @@ from deadline_worker_agent.scheduler.session_queue import (
     EnvironmentQueueEntry,
     TaskRunQueueEntry,
     SessionActionQueue,
-    SyncInputJobAttachmentsQueueEntry,
-    SyncInputJobAttachmentsStepDependenciesQueueEntry,
+    AttachmentDownloadActionQueueEntry,
+    AttachmentUploadActionQueueEntry,
 )
+import deadline_worker_agent.scheduler.session_queue as session_queue_mod
 
 from deadline_worker_agent.sessions.actions import (
     EnterEnvironmentAction,
     ExitEnvironmentAction,
     RunStepTaskAction,
     SessionActionDefinition,
-    SyncInputJobAttachmentsAction,
+    AttachmentDownloadAction,
+    AttachmentUploadAction,
 )
 from deadline_worker_agent.sessions.errors import (
     EnvironmentDetailsError,
-    JobAttachmentDetailsError,
     JobEntityUnsupportedSchemaError,
+    SessionActionError,
     StepDetailsError,
 )
 from deadline_worker_agent.sessions.job_entities import (
@@ -59,19 +62,17 @@ from deadline_worker_agent.api_models import (
     EntityIdentifier,
     EnvironmentAction,
     TaskRunAction,
-    SyncInputJobAttachmentsAction as SyncInputJobAttachmentsActionBoto,
+    AttachmentDownloadAction as AttachmentDownloadActionBoto,
+    AttachmentUploadAction as AttachmentUploadActionBoto,
 )
 
 
 _TEST_ENVIRONMENT_SCRIPT = EnvironmentScript(
-    actions=EnvironmentActions(onEnter=Action(command="test"))
-)
-_TEST_ENVIRONMENT = Environment(
-    name="TestEnv",
-    script=_TEST_ENVIRONMENT_SCRIPT,
+    actions=EnvironmentActions(onEnter=Action(command=CommandString("test")))
 )
 _TEST_STEP_TEMPLATE = StepTemplate(
-    name="TestStep", script=StepScript(actions=StepActions(onRun=Action(command="test.exe")))
+    name="TestStep",
+    script=StepScript(actions=StepActions(onRun=Action(command=CommandString("test.exe")))),
 )
 
 
@@ -131,6 +132,9 @@ class TestSessionActionQueueDequeue:
                 ExitEnvironmentAction(
                     id="id",
                     environment_id="envid",
+                    details=EnvironmentDetails(
+                        environment=Environment(name="TestEnv", script=_TEST_ENVIRONMENT_SCRIPT)
+                    ),
                 ),
                 id="env exit",
             ),
@@ -164,44 +168,6 @@ class TestSessionActionQueueDequeue:
                 ),
                 id="task run",
             ),
-            pytest.param(
-                SyncInputJobAttachmentsQueueEntry(
-                    Mock(),  # cancel event
-                    SyncInputJobAttachmentsActionBoto(
-                        sessionActionId="id",
-                        actionType="SYNC_INPUT_JOB_ATTACHMENTS",
-                    ),
-                ),
-                SyncInputJobAttachmentsAction(
-                    id="id",
-                    session_id="session-1234",
-                    job_attachment_details=JobAttachmentDetails(
-                        job_attachments_file_system=JobAttachmentsFileSystem.COPIED,
-                        manifests=[],
-                    ),
-                ),
-                id="sync input job attachments",
-            ),
-            pytest.param(
-                SyncInputJobAttachmentsStepDependenciesQueueEntry(
-                    Mock(),  # cancel event
-                    SyncInputJobAttachmentsActionBoto(
-                        sessionActionId="id",
-                        actionType="SYNC_INPUT_JOB_ATTACHMENTS",
-                        stepId="step-2",
-                    ),
-                ),
-                SyncInputJobAttachmentsAction(
-                    id="id",
-                    session_id="session-1234",
-                    step_details=StepDetails(
-                        step_template=_TEST_STEP_TEMPLATE,
-                        dependencies=["step-1"],
-                        step_id="step-1234",
-                    ),
-                ),
-                id="sync input job attachments with step Id",
-            ),
         ],
     )
     def test(
@@ -224,7 +190,124 @@ class TestSessionActionQueueDequeue:
         assert len(session_queue._actions_by_id) == 0
 
     @pytest.mark.parametrize(
-        argnames=("queue_entry", "error_type"),
+        "action, expected",
+        [
+            pytest.param(
+                AttachmentDownloadActionQueueEntry(
+                    Mock(),  # cancel event
+                    AttachmentDownloadActionBoto(
+                        sessionActionId="id",
+                        actionType="SYNC_INPUT_JOB_ATTACHMENTS",
+                    ),
+                ),
+                AttachmentDownloadAction(
+                    id="id",
+                    session_id="session-1234",
+                    job_attachment_details=JobAttachmentDetails(
+                        job_attachments_file_system=JobAttachmentsFileSystem.COPIED,
+                        manifests=[],
+                    ),
+                ),
+                id="attachment download job input",
+            ),
+            pytest.param(
+                AttachmentDownloadActionQueueEntry(
+                    Mock(),  # cancel event
+                    AttachmentDownloadActionBoto(
+                        sessionActionId="id",
+                        actionType="SYNC_INPUT_JOB_ATTACHMENTS",
+                        stepId="step-2",
+                    ),
+                ),
+                AttachmentDownloadAction(
+                    id="id",
+                    session_id="session-1234",
+                    step_details=StepDetails(
+                        step_template=_TEST_STEP_TEMPLATE,
+                        dependencies=["step-1"],
+                        step_id="step-1234",
+                    ),
+                ),
+                id="attachment download step dependency",
+            ),
+            pytest.param(
+                AttachmentUploadActionQueueEntry(
+                    Mock(),  # cancel event
+                    AttachmentUploadActionBoto(
+                        sessionActionId="id",
+                        actionType="SYNC_OUTPUT_JOB_ATTACHMENTS",
+                        stepId="step-1",
+                        taskId="task-1",
+                        startTime=1234567890.0,
+                    ),
+                ),
+                AttachmentUploadAction(
+                    id="id",
+                    session_id="session-1234",
+                    step_id="step-1",
+                    task_id="task-1",
+                    start_time=1234567890.0,
+                ),
+                id="attachment upload action",
+            ),
+        ],
+    )
+    def test_attachments_transfer_actions(
+        self,
+        action: AttachmentDownloadActionQueueEntry | AttachmentUploadActionQueueEntry,
+        expected: AttachmentDownloadAction | AttachmentUploadAction,
+        session_queue: SessionActionQueue,
+    ) -> None:
+        # GIVEN
+        session_queue._actions = [action]
+        session_queue._actions_by_id[action.definition["sessionActionId"]] = action
+
+        # WHEN
+        result = session_queue.dequeue()
+
+        # THEN
+        assert type(result) is type(expected)
+        assert result.id == expected.id  # type: ignore
+        assert len(session_queue._actions) == 0
+        assert len(session_queue._actions_by_id) == 0
+
+    def test_attachment_upload_insert_dequeue(
+        self,
+        session_queue: SessionActionQueue,
+    ) -> None:
+        # GIVEN
+        action = EnvironmentQueueEntry(
+            Mock(),  # cancel event
+            EnvironmentAction(
+                sessionActionId="id-env", actionType="ENV_ENTER", environmentId="envid"
+            ),
+        )
+        session_queue._actions = [action]
+        session_queue._actions_by_id[action.definition["sessionActionId"]] = action
+
+        upload_action = AttachmentUploadActionBoto(
+            sessionActionId="id-upload",
+            actionType="SYNC_OUTPUT_JOB_ATTACHMENTS",
+            stepId="step-1",
+            taskId="task-1",
+            startTime=1234567890.0,
+        )
+
+        # WHEN
+        session_queue.insert_front(action=upload_action)
+
+        # THEN
+        assert len(session_queue._actions) == 2
+        assert "id-upload" in session_queue._actions_by_id
+
+        # WHEN
+        next_action = session_queue.dequeue()
+
+        # THEN
+        assert type(next_action) is AttachmentUploadAction
+
+    @pytest.mark.parametrize(
+        argnames=("queue_entry", "error_type", "expected_step_id", "expected_task_id"),
         argvalues=(
             pytest.param(
                 EnvironmentQueueEntry(
@@ -234,6 +317,8 @@ class TestSessionActionQueueDequeue:
                     ),
                 ),
                 EnvironmentDetailsError,
+                None,
+                None,
                 id="Environment Details Error",
             ),
             pytest.param(
@@ -248,42 +333,18 @@ class TestSessionActionQueueDequeue:
                     ),
                 ),
                 StepDetailsError,
+                "stepId",
+                "taskId",
                 id="Step Details Error",
-            ),
-            pytest.param(
-                SyncInputJobAttachmentsQueueEntry(
-                    Mock(),  # cancel event
-                    SyncInputJobAttachmentsActionBoto(
-                        sessionActionId="id",
-                        actionType="SYNC_INPUT_JOB_ATTACHMENTS",
-                    ),
-                ),
-                JobAttachmentDetailsError,
-                id="Job Attachments Details Error",
-            ),
-            pytest.param(
-                SyncInputJobAttachmentsStepDependenciesQueueEntry(
-                    Mock(),  # cancel event
-                    SyncInputJobAttachmentsActionBoto(
-                        sessionActionId="id",
-                        actionType="SYNC_INPUT_JOB_ATTACHMENTS",
-                        stepId="step-2",
-                    ),
-                ),
-                StepDetailsError,
-                id="Job Attachments Step Details Error",
             ),
         ),
     )
     def test_handle_job_entity_error_on_dequeue(
         self,
-        queue_entry: (
-            EnvironmentQueueEntry
-            | TaskRunQueueEntry
-            | SyncInputJobAttachmentsQueueEntry
-            | SyncInputJobAttachmentsStepDependenciesQueueEntry
-        ),
-        error_type: type[Exception],
+        queue_entry: (EnvironmentQueueEntry | TaskRunQueueEntry),
+        error_type: type[SessionActionError],
+        expected_step_id: str | None,
+        expected_task_id: str | None,
         session_queue: SessionActionQueue,
     ) -> None:
         # GIVEN
@@ -297,9 +358,24 @@ class TestSessionActionQueueDequeue:
         job_entity_mock.job_attachment_details.side_effect = inner_error
         session_queue._job_entities = job_entity_mock
 
-        # WHEN / THEN
-        with pytest.raises(error_type):
+        # WHEN
+        with pytest.raises(error_type) as excinfo:
             session_queue.dequeue()
+
+        # THEN
+        # The Session error handler reads e.step_id/e.task_id when reporting the
+        # failure. They must be populated (not raise AttributeError) so that the
+        # action fails cleanly instead of triggering an unexpected worker error
+        # and reschedule loop.
+        assert excinfo.value.step_id == expected_step_id
+        assert excinfo.value.task_id == expected_task_id
+        # The failed action must be removed from the queue. If it were left
+        # queued, cancel_all() would re-report it as NEVER_ATTEMPTED and clobber
+        # the FAILED status the Session reports -- which the service rejects for
+        # the first session action, crashing the worker scheduler.
+        action_id = queue_entry.definition["sessionActionId"]
+        assert session_queue._actions == []
+        assert action_id not in session_queue._actions_by_id
 
     @pytest.mark.parametrize(
         argnames=("queue_entry"),
@@ -330,12 +406,7 @@ class TestSessionActionQueueDequeue:
     )
     def test_handle_unsupported_schema_on_dequeue(
         self,
-        queue_entry: (
-            EnvironmentQueueEntry
-            | TaskRunQueueEntry
-            | SyncInputJobAttachmentsQueueEntry
-            | SyncInputJobAttachmentsStepDependenciesQueueEntry
-        ),
+        queue_entry: (EnvironmentQueueEntry | TaskRunQueueEntry),
         session_queue: SessionActionQueue,
     ) -> None:
         # GIVEN
@@ -468,19 +539,11 @@ class TestIdentifiers:
                             parameters={},
                         ),
                     ),
-                    SyncInputJobAttachmentsQueueEntry(
+                    AttachmentDownloadActionQueueEntry(
                         Mock(),  # cancel event
-                        SyncInputJobAttachmentsActionBoto(
+                        AttachmentDownloadActionBoto(
                             sessionActionId="id",
                             actionType="SYNC_INPUT_JOB_ATTACHMENTS",
-                        ),
-                    ),
-                    SyncInputJobAttachmentsStepDependenciesQueueEntry(
-                        Mock(),  # cancel event
-                        SyncInputJobAttachmentsActionBoto(
-                            sessionActionId="id",
-                            actionType="SYNC_INPUT_JOB_ATTACHMENTS",
-                            stepId="step-2",
                         ),
                     ),
                 ],
@@ -501,12 +564,6 @@ class TestIdentifiers:
                             jobId="job-12ca328a79904b28ad708aeac7dbb2a8",
                         )
                     ),
-                    StepDetailsIdentifier(
-                        stepDetails=StepDetailsIdentifierFields(
-                            jobId="job-12ca328a79904b28ad708aeac7dbb2a8",
-                            stepId="step-2",
-                        ),
-                    ),
                 ],
                 id="Multiple Entities",
             ),
@@ -518,8 +575,8 @@ class TestIdentifiers:
         queue_entries: list[
             EnvironmentQueueEntry
             | TaskRunQueueEntry
-            | SyncInputJobAttachmentsQueueEntry
-            | SyncInputJobAttachmentsStepDependenciesQueueEntry,
+            | AttachmentDownloadActionQueueEntry
+            | AttachmentUploadActionQueueEntry
         ],
         expected_identifiers: list[EntityIdentifier] | None,
     ):
@@ -533,3 +590,310 @@ class TestIdentifiers:
 
         # THEN
         assert identifiers == expected_identifiers
+
+
+class TestPeekResolvedSymbolTableJson:
+    """Tests for SessionActionQueue.peek_resolved_symbol_table_json"""
+
+    def test_returns_none_for_empty_queue(
+        self,
+        session_queue: SessionActionQueue,
+    ) -> None:
+        # GIVEN
+        assert session_queue._actions == []
+
+        # WHEN
+        result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN
+        assert result is None
+
+    def test_returns_environment_table_when_first_action_is_env_enter(
+        self,
+        session_queue: SessionActionQueue,
+        job_entities: MagicMock,
+    ) -> None:
+        # GIVEN
+        table_json = '[{"name":"Job.Name","type":"string","value":"Example Job"}]'
+        job_entities.environment_details.return_value = EnvironmentDetails(
+            environment=Environment(name="TestEnv", script=_TEST_ENVIRONMENT_SCRIPT),
+            resolved_symbol_table_json=table_json,
+        )
+        entry = EnvironmentQueueEntry(
+            Mock(),
+            EnvironmentAction(
+                sessionActionId="action-1", actionType="ENV_ENTER", environmentId="env-1"
+            ),
+        )
+        session_queue._actions = [entry]
+        session_queue._actions_by_id["action-1"] = entry
+
+        # WHEN
+        result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN
+        assert result == table_json
+        job_entities.environment_details.assert_called_once_with(environment_id="env-1")
+
+    def test_returns_environment_table_when_first_action_is_env_exit(
+        self,
+        session_queue: SessionActionQueue,
+        job_entities: MagicMock,
+    ) -> None:
+        # GIVEN
+        table_json = '[{"name":"Job.Name","type":"string","value":"Example Job"}]'
+        job_entities.environment_details.return_value = EnvironmentDetails(
+            environment=Environment(name="TestEnv", script=_TEST_ENVIRONMENT_SCRIPT),
+            resolved_symbol_table_json=table_json,
+        )
+        entry = EnvironmentQueueEntry(
+            Mock(),
+            EnvironmentAction(
+                sessionActionId="action-1", actionType="ENV_EXIT", environmentId="env-1"
+            ),
+        )
+        session_queue._actions = [entry]
+        session_queue._actions_by_id["action-1"] = entry
+
+        # WHEN
+        result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN
+        assert result == table_json
+        job_entities.environment_details.assert_called_once_with(environment_id="env-1")
+
+    def test_returns_step_table_when_first_action_is_task_run(
+        self,
+        session_queue: SessionActionQueue,
+        job_entities: MagicMock,
+    ) -> None:
+        # GIVEN
+        table_json = '[{"name":"Job.Name","type":"string","value":"Example Job"}]'
+        job_entities.step_details.return_value = StepDetails(
+            step_template=_TEST_STEP_TEMPLATE,
+            step_id="step-1",
+            resolved_symbol_table_json=table_json,
+        )
+        entry = TaskRunQueueEntry(
+            Mock(),
+            TaskRunAction(
+                sessionActionId="action-1",
+                actionType="TASK_RUN",
+                stepId="step-1",
+                taskId="task-1",
+                parameters={},
+            ),
+        )
+        session_queue._actions = [entry]
+        session_queue._actions_by_id["action-1"] = entry
+
+        # WHEN
+        result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN
+        assert result == table_json
+        job_entities.step_details.assert_called_once_with(step_id="step-1")
+
+    def test_returns_none_and_does_not_raise_when_entity_resolution_raises(
+        self,
+        session_queue: SessionActionQueue,
+        job_entities: MagicMock,
+    ) -> None:
+        # GIVEN
+        job_entities.environment_details.side_effect = RuntimeError("service unavailable")
+        entry = EnvironmentQueueEntry(
+            Mock(),
+            EnvironmentAction(
+                sessionActionId="action-1", actionType="ENV_ENTER", environmentId="env-1"
+            ),
+        )
+        session_queue._actions = [entry]
+        session_queue._actions_by_id["action-1"] = entry
+
+        # WHEN
+        with patch.object(session_queue_mod, "logger") as mock_logger:
+            result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN
+        assert result is None
+        mock_logger.warning.assert_called_once()
+
+    def test_does_not_consume_queue(
+        self,
+        session_queue: SessionActionQueue,
+        job_entities: MagicMock,
+    ) -> None:
+        # GIVEN
+        table_json = '[{"name":"Job.Name","type":"string","value":"Example Job"}]'
+        job_entities.environment_details.return_value = EnvironmentDetails(
+            environment=Environment(name="TestEnv", script=_TEST_ENVIRONMENT_SCRIPT),
+            resolved_symbol_table_json=table_json,
+        )
+        entry = EnvironmentQueueEntry(
+            Mock(),
+            EnvironmentAction(
+                sessionActionId="action-1", actionType="ENV_ENTER", environmentId="env-1"
+            ),
+        )
+        session_queue._actions = [entry]
+        session_queue._actions_by_id["action-1"] = entry
+
+        # WHEN
+        peek_result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN — queue is unmodified
+        assert len(session_queue._actions) == 1
+        assert "action-1" in session_queue._actions_by_id
+
+        # AND — subsequent dequeue yields the same action
+        dequeue_result = session_queue.dequeue()
+        assert dequeue_result is not None
+        assert dequeue_result.id == "action-1"
+        assert peek_result == table_json
+
+
+class TestPeekResolvedSymbolTableJsonScansPastSync:
+    """Tests that peek scans past non-ENV/non-TASK actions to find the symbol table.
+
+    These cover the gap-22 scenario: when SYNC_INPUT_JOB_ATTACHMENTS is the
+    first queued action, Job.Name must still be resolved from a subsequent
+    ENV_* or TASK_RUN action.
+    """
+
+    def test_returns_env_table_when_sync_input_precedes_env_enter(
+        self,
+        session_queue: SessionActionQueue,
+        job_entities: MagicMock,
+    ) -> None:
+        # GIVEN — sync action is first, env action is second
+        table_json = '[{"name":"Job.Name","type":"string","value":"MyJob"}]'
+        job_entities.environment_details.return_value = EnvironmentDetails(
+            environment=Environment(name="TestEnv", script=_TEST_ENVIRONMENT_SCRIPT),
+            resolved_symbol_table_json=table_json,
+        )
+        sync_entry = AttachmentDownloadActionQueueEntry(
+            Mock(),
+            AttachmentDownloadActionBoto(
+                sessionActionId="sync-1", actionType="SYNC_INPUT_JOB_ATTACHMENTS"
+            ),
+        )
+        env_entry = EnvironmentQueueEntry(
+            Mock(),
+            EnvironmentAction(
+                sessionActionId="env-1", actionType="ENV_ENTER", environmentId="env-1"
+            ),
+        )
+        session_queue._actions = [sync_entry, env_entry]
+        session_queue._actions_by_id["sync-1"] = sync_entry
+        session_queue._actions_by_id["env-1"] = env_entry
+
+        # WHEN
+        result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN
+        assert result == table_json
+        job_entities.environment_details.assert_called_once_with(environment_id="env-1")
+
+    def test_returns_none_when_queue_has_only_sync_actions(
+        self,
+        session_queue: SessionActionQueue,
+    ) -> None:
+        # GIVEN — queue contains only attachment sync actions (no ENV/TASK)
+        sync_entry = AttachmentDownloadActionQueueEntry(
+            Mock(),
+            AttachmentDownloadActionBoto(
+                sessionActionId="sync-1", actionType="SYNC_INPUT_JOB_ATTACHMENTS"
+            ),
+        )
+        upload_entry = AttachmentUploadActionQueueEntry(
+            Mock(),
+            AttachmentUploadActionBoto(
+                sessionActionId="upload-1",
+                actionType="SYNC_OUTPUT_JOB_ATTACHMENTS",
+                stepId="step-1",
+                startTime=0.0,
+            ),
+        )
+        session_queue._actions = [sync_entry, upload_entry]
+        session_queue._actions_by_id["sync-1"] = sync_entry
+        session_queue._actions_by_id["upload-1"] = upload_entry
+
+        # WHEN
+        result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN — no ENV/TASK action exists, so None is correct
+        assert result is None
+
+    def test_skips_action_whose_entity_resolution_fails_and_returns_next(
+        self,
+        session_queue: SessionActionQueue,
+        job_entities: MagicMock,
+    ) -> None:
+        # GIVEN — first ENV action's entity resolution fails, second succeeds
+        table_json = '[{"name":"Job.Name","type":"string","value":"MyJob"}]'
+        env_details_good = EnvironmentDetails(
+            environment=Environment(name="TestEnv", script=_TEST_ENVIRONMENT_SCRIPT),
+            resolved_symbol_table_json=table_json,
+        )
+        job_entities.environment_details.side_effect = [
+            RuntimeError("entity fetch failed"),
+            env_details_good,
+        ]
+        entry_bad = EnvironmentQueueEntry(
+            Mock(),
+            EnvironmentAction(
+                sessionActionId="env-bad", actionType="ENV_ENTER", environmentId="env-bad"
+            ),
+        )
+        entry_good = EnvironmentQueueEntry(
+            Mock(),
+            EnvironmentAction(
+                sessionActionId="env-good", actionType="ENV_ENTER", environmentId="env-good"
+            ),
+        )
+        session_queue._actions = [entry_bad, entry_good]
+        session_queue._actions_by_id["env-bad"] = entry_bad
+        session_queue._actions_by_id["env-good"] = entry_good
+
+        # WHEN
+        with patch.object(session_queue_mod, "logger") as mock_logger:
+            result = session_queue.peek_resolved_symbol_table_json()
+
+        # THEN — skipped the failed entity, returned from the good one
+        assert result == table_json
+        mock_logger.warning.assert_called_once()
+
+
+class TestDequeueEnvExitDetails:
+    """Tests that ENV_EXIT dequeue produces an ExitEnvironmentAction carrying fetched details"""
+
+    def test_env_exit_dequeue_includes_details(
+        self,
+        session_queue: SessionActionQueue,
+        job_entities: MagicMock,
+    ) -> None:
+        # GIVEN
+        table_json = '[{"name":"Job.Name","type":"string","value":"Example Job"}]'
+        env_details = EnvironmentDetails(
+            environment=Environment(name="TestEnv", script=_TEST_ENVIRONMENT_SCRIPT),
+            resolved_symbol_table_json=table_json,
+        )
+        job_entities.environment_details.return_value = env_details
+        entry = EnvironmentQueueEntry(
+            Mock(),
+            EnvironmentAction(
+                sessionActionId="action-1", actionType="ENV_EXIT", environmentId="env-1"
+            ),
+        )
+        session_queue._actions = [entry]
+        session_queue._actions_by_id["action-1"] = entry
+
+        # WHEN
+        result = session_queue.dequeue()
+
+        # THEN
+        assert isinstance(result, ExitEnvironmentAction)
+        assert result.id == "action-1"
+        # The details kwarg is passed to ExitEnvironmentAction; verify the
+        # attribute is set (concurrent agent adds _details field).
+        assert result._details is env_details  # type: ignore[attr-defined]

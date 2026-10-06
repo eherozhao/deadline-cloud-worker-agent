@@ -1,4 +1,5 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+from __future__ import annotations
 
 from typing import Any, Generator, Optional
 from unittest.mock import ANY, MagicMock, call, patch
@@ -6,11 +7,11 @@ import stat
 from tempfile import TemporaryDirectory
 from pathlib import Path
 import json
-
 from botocore.exceptions import ClientError
 from pytest import fixture, mark, param, raises
 
 from deadline_worker_agent.api_models import (
+    HostConfiguration,
     HostProperties,
     LogConfiguration,
     UpdateWorkerResponse,
@@ -21,13 +22,14 @@ from deadline_worker_agent.log_sync.cloudwatch import (
     LOG_CONFIG_OPTION_GROUP_NAME_KEY,
     LOG_CONFIG_OPTION_STREAM_NAME_KEY,
 )
-from deadline_worker_agent.startup.cli_args import ParsedCommandLineArguments
-from deadline_worker_agent.startup.config import Configuration
+from deadline_worker_agent.config import Configuration
+from deadline_worker_agent.config.cli_args import ParsedCommandLineArguments
 from deadline_worker_agent.startup.bootstrap import WorkerPersistenceInfo
 from deadline_worker_agent.startup import bootstrap as bootstrap_mod
 from deadline_worker_agent.aws.deadline import (
     DeadlineRequestConditionallyRecoverableError,
     DeadlineRequestUnrecoverableError,
+    WorkerHostConfiguration,
     WorkerLogConfig,
     construct_worker_log_config,
 )
@@ -49,6 +51,11 @@ AWSLOGS_LOG_CONFIGURATION = LogConfiguration(
         LOG_CONFIG_OPTION_STREAM_NAME_KEY: CLOUDWATCH_LOG_STREAM,
     },
 )
+
+HOST_CONFIGURATION = HostConfiguration(scriptBody="echo HELLOWORLD", scriptTimeoutSeconds=456)
+
+INSTANCE_ID = "i-aaaaaaaaaaaaaaaa"
+WORKER_ID = f"worker-{32 * 'a'}"
 
 
 @fixture
@@ -143,6 +150,16 @@ def cloudwatch_log_stream() -> str:
 
 
 @fixture
+def host_configuration_script() -> str:
+    return "echo Hello"
+
+
+@fixture
+def host_configuration_script_timeout() -> int:
+    return 456
+
+
+@fixture
 def update_worker_started_success_response(
     cloudwatch_log_group: str,
     cloudwatch_log_stream: str,
@@ -222,7 +239,9 @@ class TestWorkerInfo:
         # GIVEN
         config.worker_state_file = worker_state_file = MagicMock()
         worker_state_file.is_absolute.return_value = True
-        with (patch.object(bootstrap_mod.json, "dump") as dump_mock,):
+        with (
+            patch.object(bootstrap_mod.json, "dump") as dump_mock,
+        ):
             state_file_open_mock: MagicMock = worker_state_file.open
             state_file_touch_mock: MagicMock = worker_state_file.touch
             state_file_open_mock_enter: MagicMock = state_file_open_mock.return_value.__enter__
@@ -362,6 +381,15 @@ class TestBootstrapWorker:
             cloudwatch_log_stream=cloudwatch_log_stream,
         )
 
+    @fixture
+    def worker_host_config(
+        self, host_configuration_script: str, host_configuration_script_timeout: int
+    ) -> WorkerHostConfiguration:
+        return WorkerHostConfiguration(
+            script_body=host_configuration_script,
+            script_timeout_seconds=host_configuration_script_timeout,
+        )
+
     def test_success(
         self,
         config: Configuration,
@@ -370,18 +398,20 @@ class TestBootstrapWorker:
         get_boto3_session_for_fleet_role_mock: MagicMock,
         start_worker_mock: MagicMock,
         worker_log_config: WorkerLogConfig,
+        worker_host_config: WorkerHostConfiguration,
         enforce_no_instance_profile_or_stop_worker_mock: MagicMock,
     ) -> None:
         """Test of the happy-path of bootstrap_worker()."""
         # GIVEN
         load_or_create_worker_mock.return_value = (worker_info, False)
-        start_worker_mock.return_value = worker_log_config
+        start_worker_mock.return_value = (worker_log_config, worker_host_config)
 
         # WHEN
         worker_bootstrap = bootstrap_mod.bootstrap_worker(config=config)
 
         # THEN
         assert worker_bootstrap.log_config is worker_log_config
+        assert worker_bootstrap.host_config is worker_host_config
         assert worker_bootstrap.session is get_boto3_session_for_fleet_role_mock.return_value
         assert worker_bootstrap.worker_info is worker_info
         enforce_no_instance_profile_or_stop_worker_mock.assert_called_once_with(
@@ -459,7 +489,7 @@ class TestBootstrapWorker:
         # GIVEN
         load_or_create_worker_mock.side_effect = [(worker_info, True), (worker_info, False)]
         start_worker_exception = bootstrap_mod.BootstrapWithoutWorkerLoad()
-        start_worker_mock.side_effect = [start_worker_exception, worker_log_config]
+        start_worker_mock.side_effect = [start_worker_exception, (worker_log_config, None)]
 
         # WHEN
         worker_bootstrap = bootstrap_mod.bootstrap_worker(config=config)
@@ -490,6 +520,12 @@ class TestLoadOrCreateWorker:
     def session_mock(self) -> MagicMock:
         return MagicMock()
 
+    @fixture(autouse=True)
+    def get_instance_id_mock(self) -> Generator[MagicMock, None, None]:
+        with patch.object(bootstrap_mod, "_get_instance_id") as get_instance_id_mock:
+            get_instance_id_mock.return_value = INSTANCE_ID
+            yield get_instance_id_mock
+
     @fixture
     def deadline_client_mock(self, session_mock: MagicMock) -> MagicMock:
         deadline_client = MagicMock()
@@ -509,12 +545,24 @@ class TestLoadOrCreateWorker:
             create_worker_mock.return_value = {"workerId": worker_id}
             yield create_worker_mock
 
+    @mark.parametrize(
+        "saved_instance_id, get_instance_id_value",
+        [
+            param(INSTANCE_ID, INSTANCE_ID, id="same-instance-id"),
+            param(None, INSTANCE_ID, id="no-saved-instance-id"),
+            param(INSTANCE_ID, None, id="saved-instance-id-no-imds"),
+            param(None, None, id="no-saved-instance-id-no-imds"),
+        ],
+    )
     def test_existing_worker_successful_restore(
         self,
         worker_persistence_info_mock: MagicMock,
         session_mock: MagicMock,
         config: Configuration,
         create_worker_mock: MagicMock,
+        get_instance_id_mock: MagicMock,
+        saved_instance_id: str | None,
+        get_instance_id_value: str | None,
     ) -> None:
         """
         Test that we return a previously saved Worker when there is one.
@@ -522,8 +570,10 @@ class TestLoadOrCreateWorker:
 
         # GIVEN
         worker_info_mock = MagicMock()
+        worker_info_mock.instance_id = saved_instance_id
         worker_persistence_info_mock.load.return_value = worker_info_mock
         worker_persistence_info_mock.save = MagicMock()
+        get_instance_id_mock.return_value = get_instance_id_value
 
         # WHEN
         worker_info_result, has_existing_result = bootstrap_mod._load_or_create_worker(
@@ -536,24 +586,41 @@ class TestLoadOrCreateWorker:
         worker_persistence_info_mock.load.assert_called_once_with(config=config)
         worker_persistence_info_mock.save.assert_not_called()
         create_worker_mock.assert_not_called()
-        worker_info_mock.save.assert_not_called()
+        if get_instance_id_value is not None and saved_instance_id is None:
+            worker_info_mock.save.assert_called_once_with(config=config)
+            assert worker_info_mock.instance_id == get_instance_id_value
+        else:
+            worker_info_mock.save.assert_not_called()
 
+    @mark.parametrize(
+        "load_result",
+        [
+            param(None, id="no-saved-state"),
+            param(
+                WorkerPersistenceInfo(worker_id=WORKER_ID, instance_id=INSTANCE_ID + "1"),
+                id="saved-state-diff-instance-id",
+            ),
+        ],
+    )
     def test_creates_worker_when_no_existing(
         self,
-        worker_id: str,
         worker_persistence_info_mock: MagicMock,
         session_mock: MagicMock,
         deadline_client_mock: MagicMock,
         config: Configuration,
         create_worker_mock: MagicMock,
         host_properties: HostProperties,
+        load_result: WorkerPersistenceInfo | None,
     ):
-        """Test that we create and persist a new worker when there is no previously saved Worker to load."""
+        """
+        Test that we create and persist a new worker when there is no previously saved Worker to load.
+        Or when the previously saved Worker has a different instance ID
+        """
 
         # GIVEN
         worker_info_mock = MagicMock()
         worker_persistence_info_mock.return_value = worker_info_mock
-        worker_persistence_info_mock.load.return_value = None
+        worker_persistence_info_mock.load.return_value = load_result
 
         # WHEN
         worker_info_result, has_existing_result = bootstrap_mod._load_or_create_worker(
@@ -566,7 +633,9 @@ class TestLoadOrCreateWorker:
         create_worker_mock.assert_called_once_with(
             deadline_client=deadline_client_mock, config=config, host_properties=host_properties
         )
-        worker_persistence_info_mock.assert_called_once_with(worker_id=worker_id)
+        worker_persistence_info_mock.assert_called_once_with(
+            worker_id=WORKER_ID, instance_id=INSTANCE_ID
+        )
         worker_info_mock.save.assert_called_once_with(config=config)
         session_mock.client.assert_called_once_with("deadline", config=DEADLINE_BOTOCORE_CONFIG)
 
@@ -713,12 +782,24 @@ class TestStartWorker:
             yield mock
 
     @mark.parametrize(
-        "has_existing_worker, log_config",
+        "has_existing_worker, log_config, host_config",
         [
-            param(True, AWSLOGS_LOG_CONFIGURATION, id="has-existing-with-logs"),
-            param(False, AWSLOGS_LOG_CONFIGURATION, id="no-existing-with-logs"),
-            param(True, None, id="has-existing-no-logs"),
-            param(False, None, id="no-existing-no-logs"),
+            param(True, AWSLOGS_LOG_CONFIGURATION, None, id="has-existing-with-logs"),
+            param(False, AWSLOGS_LOG_CONFIGURATION, None, id="no-existing-with-logs"),
+            param(True, None, None, id="has-existing-no-logs"),
+            param(False, None, None, id="no-existing-no-logs"),
+            param(
+                True,
+                AWSLOGS_LOG_CONFIGURATION,
+                HOST_CONFIGURATION,
+                id="has-existing-with-host-config",
+            ),
+            param(
+                False,
+                AWSLOGS_LOG_CONFIGURATION,
+                HOST_CONFIGURATION,
+                id="no-existing-with-host-config",
+            ),
         ],
     )
     def test_success(
@@ -727,6 +808,7 @@ class TestStartWorker:
         worker_id: str,
         has_existing_worker: bool,
         log_config: Optional[LogConfiguration],
+        host_config: Optional[HostConfiguration],
         deadline_client: MagicMock,
         update_worker_mock: MagicMock,
         mock_get_host_properties: MagicMock,
@@ -738,10 +820,12 @@ class TestStartWorker:
         update_worker_response = dict[str, Any]()
         if log_config:
             update_worker_response["log"] = log_config
+        if host_config:
+            update_worker_response["hostConfiguration"] = host_config
         update_worker_mock.return_value = update_worker_response
 
         # WHEN
-        result = bootstrap_mod._start_worker(
+        log_result, host_config_result = bootstrap_mod._start_worker(
             deadline_client=deadline_client,
             config=config,
             worker_id=worker_id,
@@ -760,9 +844,18 @@ class TestStartWorker:
             host_properties=host_properties,
         )
         if not log_config:
-            assert result is None
+            assert log_result is None
         else:
-            assert result == construct_worker_log_config(log_config=log_config)
+            assert log_result == construct_worker_log_config(log_config=log_config)
+
+        if not host_config:
+            assert host_config_result is None
+        else:
+            assert host_config_result is not None
+            assert host_config_result.script_body == host_config.get("scriptBody")
+            assert host_config_result.script_timeout_seconds == host_config.get(
+                "scriptTimeoutSeconds"
+            )
 
     @mark.parametrize(
         "has_existing_worker, exception",
@@ -838,7 +931,6 @@ class TestStartWorker:
             )
 
 
-@mark.usefixtures("get_metadata_mock")
 class TestEnforceNoInstanceProfile:
     def test_success(
         self,
@@ -900,6 +992,62 @@ class TestEnforceNoInstanceProfile:
             "Unexpected HTTP status code (%d) from /iam/info IMDS response",
             unexpected_status_code,
         )
+
+    def test_imds_exception_handling(
+        self,
+        mod_logger_mock: MagicMock,
+    ) -> None:
+        # GIVEN
+        logger_info: MagicMock = mod_logger_mock.info
+        with patch.object(
+            bootstrap_mod.requests,
+            "put",
+            side_effect=bootstrap_mod.requests.ConnectionError("Testing"),
+        ) as requests_put_mock:
+            # WHEN
+            result = bootstrap_mod._get_metadata("iam/info")
+
+        # THEN
+        requests_put_mock.assert_called_once()
+        logger_info.assert_called_once_with(
+            "Not running on EC2 or the metadata service was unable to be found!",
+        )
+        assert result is None
+
+    def test_imds_none_then_recovers(
+        self,
+        get_metadata_mock: MagicMock,
+    ) -> None:
+        """When _get_metadata returns None initially but succeeds on retry with 404,
+        the function should return normally."""
+        # GIVEN
+        success_response = MagicMock()
+        success_response.status_code = 404
+
+        get_metadata_mock.side_effect = [None, success_response]
+
+        # WHEN/THEN (no error raised)
+        bootstrap_mod._enforce_no_instance_profile()
+
+        # THEN
+        assert get_metadata_mock.call_count == 2
+
+    def test_imds_none_all_retries_exhausted_raises(
+        self,
+        get_metadata_mock: MagicMock,
+    ) -> None:
+        """When _get_metadata always returns None, IMDSUnreachableError should be raised
+        after IMDS_RETRY_MAX_ATTEMPTS + 1 calls (1 initial + retries)."""
+        # GIVEN
+        get_metadata_mock.return_value = None
+
+        # THEN
+        with raises(bootstrap_mod.IMDSUnreachableError):
+            # WHEN
+            bootstrap_mod._enforce_no_instance_profile()
+
+        # THEN - 1 initial call + IMDS_RETRY_MAX_ATTEMPTS retries
+        assert get_metadata_mock.call_count == 1 + bootstrap_mod.IMDS_RETRY_MAX_ATTEMPTS
 
 
 class TestEnforceNoInstanceProfileOrStopWorker:
@@ -972,6 +1120,40 @@ class TestEnforceNoInstanceProfileOrStopWorker:
 
         # THEN
         with raises(bootstrap_mod.InstanceProfileAttachedError) as raise_ctx:
+            # WHEN
+            bootstrap_mod._enforce_no_instance_profile_or_stop_worker(
+                config=config,
+                worker_id=worker_id,
+                deadline_client=client,
+            )
+
+        # THEN
+        assert raise_ctx.value is exception
+        mock_enforce_no_instance_profile.assert_called_once_with()
+        update_worker_mock.assert_called_once_with(
+            deadline_client=client,
+            farm_id=config.farm_id,
+            fleet_id=config.fleet_id,
+            worker_id=worker_id,
+            status=WorkerStatus.STOPPED,
+        )
+
+    def test_imds_unreachable_stops_worker(
+        self,
+        mock_enforce_no_instance_profile: MagicMock,
+        update_worker_mock: MagicMock,
+        config: Configuration,
+        worker_id: str,
+        client: MagicMock,
+    ) -> None:
+        """When _enforce_no_instance_profile raises IMDSUnreachableError,
+        the worker should be stopped and the error re-raised."""
+        # GIVEN
+        exception = bootstrap_mod.IMDSUnreachableError(attempts=5)
+        mock_enforce_no_instance_profile.side_effect = exception
+
+        # THEN
+        with raises(bootstrap_mod.IMDSUnreachableError) as raise_ctx:
             # WHEN
             bootstrap_mod._enforce_no_instance_profile_or_stop_worker(
                 config=config,

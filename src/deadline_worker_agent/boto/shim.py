@@ -18,7 +18,7 @@ from ..api_models import (
     CreateWorkerResponse,
     EnvironmentAction,
     HostProperties,
-    SyncInputJobAttachmentsAction,
+    AttachmentDownloadAction,
     TaskRunAction,
     UpdatedSessionActionInfo,
     UpdateWorkerResponse,
@@ -154,17 +154,18 @@ class DeadlineClient:
             mapped_action = TaskRunAction(
                 sessionActionId=action_id,
                 actionType="TASK_RUN",
-                taskId=action["taskId"],
                 stepId=action["stepId"],
             )
+            if action.get("taskId"):
+                mapped_action["taskId"] = action["taskId"]
             if parameters := action.get("parameters", None):
                 mapped_action["parameters"] = parameters
             return mapped_action
 
-        def parse_sync_input_job_attachments_action(
+        def parse_attachment_download_action(
             action: dict, action_id: str
-        ) -> SyncInputJobAttachmentsAction:
-            mapped_action = SyncInputJobAttachmentsAction(
+        ) -> AttachmentDownloadAction:
+            mapped_action = AttachmentDownloadAction(
                 sessionActionId=action_id,
                 actionType="SYNC_INPUT_JOB_ATTACHMENTS",
             )
@@ -174,7 +175,10 @@ class DeadlineClient:
 
         SESSION_ACTION_MAP: dict[
             str,
-            Callable[[Any, str], EnvironmentAction | TaskRunAction | SyncInputJobAttachmentsAction],
+            Callable[
+                [Any, str],
+                EnvironmentAction | TaskRunAction | AttachmentDownloadAction,
+            ],
         ] = {
             "envEnter": lambda action, action_id: EnvironmentAction(
                 sessionActionId=action_id,
@@ -187,15 +191,13 @@ class DeadlineClient:
                 environmentId=action["environmentId"],
             ),
             "taskRun": parse_task_run_action,
-            "syncInputJobAttachments": parse_sync_input_job_attachments_action,
+            "syncInputJobAttachments": parse_attachment_download_action,
         }
 
         # Map the new session action structure to our internal model
         mapped_sessions: dict[str, AssignedSession] = {}
         for session_id, session in response["assignedSessions"].items():
-            mapped_actions: list[
-                EnvironmentAction | TaskRunAction | SyncInputJobAttachmentsAction
-            ] = []
+            mapped_actions: list[EnvironmentAction | TaskRunAction | AttachmentDownloadAction] = []
             for session_action in session["sessionActions"]:
                 assert len(session_action["definition"].items()) == 1
                 (definition,) = session_action["definition"].items()
@@ -212,13 +214,15 @@ class DeadlineClient:
             )
             if log_configuration := session.get("logConfiguration", None):
                 mapped_session["logConfiguration"] = log_configuration
+            if metadata := session.get("metadata", None):
+                mapped_session["metadata"] = metadata
 
             mapped_sessions[session_id] = mapped_session
 
         return UpdateWorkerScheduleResponse(
             assignedSessions=mapped_sessions,
             cancelSessionActions=response["cancelSessionActions"],
-            desiredWorkerStatus=response.get("desiredWorkerStatus", None),
+            desiredWorkerStatus=response.get("desiredWorkerStatus", None),  # type: ignore
             updateIntervalSeconds=response["updateIntervalSeconds"],
         )
 

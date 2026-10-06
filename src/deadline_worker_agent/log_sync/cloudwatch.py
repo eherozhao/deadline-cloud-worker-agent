@@ -25,8 +25,10 @@ __all__ = [
     "stream_cloudwatch_logs",
 ]
 
-LOG_CONFIG_OPTION_GROUP_NAME_KEY = "logGroupName"
-LOG_CONFIG_OPTION_STREAM_NAME_KEY = "logStreamName"
+from .log_constants import (
+    LOG_CONFIG_OPTION_GROUP_NAME_KEY,  # noqa: F401 - re-exported for backwards compatibility
+    LOG_CONFIG_OPTION_STREAM_NAME_KEY,  # noqa: F401
+)
 
 
 class PutLogEventsConstraints(NamedTuple):
@@ -330,9 +332,9 @@ class CloudWatchLogEventPartitioner:
             ValueError - raised when the input string could not be chunked into valid UTF-8 strings. This is likely due
             to a malformed string input that encodes to a nonvalid UTF-8 byte sequence.
         """
-        assert (
-            size >= 4
-        ), f"Chunk size too small ({size}). Must be at least 4 bytes to handle all UTF-8 characters."
+        assert size >= 4, (
+            f"Chunk size too small ({size}). Must be at least 4 bytes to handle all UTF-8 characters."
+        )
 
         start = 0
         chunks: list[tuple[str, int]] = []
@@ -419,6 +421,8 @@ class CloudWatchLogStreamThread(Thread):
         self._log_stream_name = log_stream_name
         self._stop_event = stop_event
         self._prev_request_times: Deque[float] = deque()
+        if "name" not in kwargs:  # pragma: no cover
+            kwargs["name"] = f"CloudWatchLogStreamThread({log_group_name}-{log_stream_name})"
 
         super().__init__(*args, **kwargs)
 

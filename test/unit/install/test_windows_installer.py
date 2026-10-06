@@ -6,6 +6,8 @@ import typing
 from typing import Generator
 from unittest.mock import Mock, call, patch, MagicMock, ANY
 
+from deadline_worker_agent.file_system_operations import FileSystemPermissionEnum
+
 import pytest
 
 if sys.platform != "win32":
@@ -15,6 +17,7 @@ from deadline_worker_agent import installer as installer_mod
 from deadline_worker_agent.installer import ParsedCommandLineArguments, win_installer, install
 from deadline_worker_agent.windows.win_service import WorkerAgentWindowsService
 
+import pywintypes
 import win32con
 import win32netcon
 import win32profile
@@ -48,6 +51,7 @@ def parsed_kwargs(parsed_args: ParsedCommandLineArguments) -> Generator[dict, No
             "grant_required_access": parsed_args.grant_required_access,
             "allow_ec2_instance_profile": not parsed_args.disallow_instance_profile,
             "windows_job_user": parsed_args.windows_job_user,
+            "session_root_dir": parsed_args.session_root_dir,
         }
 
 
@@ -119,6 +123,37 @@ def test_start_windows_installer_fails_when_windows_job_user_is_agent_user(
     mock_users_equal.assert_called_once_with(
         parsed_kwargs["windows_job_user"], parsed_kwargs["user_name"]
     )
+
+
+# Override the "user" fixture, which feeds into the parsed_kwargs fixture
+# with Valid domain username formats. For valid domain user formats, see:
+# https://learn.microsoft.com/en-us/windows/win32/secauthn/user-name-formats
+@pytest.mark.parametrize(
+    argnames="user",
+    argvalues=(
+        pytest.param("user@domain", id="user principal name"),
+        pytest.param(r"domain\username", id="down-level logon name"),
+    ),
+)
+# No job user override
+@pytest.mark.parametrize(
+    argnames="windows_job_user",
+    argvalues=(None,),
+)
+def test_start_windows_installer_fails_on_nonexistent_domain_worker_user(
+    parsed_kwargs: dict,
+) -> None:
+    # GIVEN
+    with (
+        patch.object(shell, "IsUserAnAdmin", return_value=True),
+        patch.object(win_installer, "check_account_existence", return_value=False),
+        pytest.raises(win_installer.InstallerFailedException) as raise_ctx,
+    ):
+        # WHEN
+        win_installer.start_windows_installer(**parsed_kwargs)
+
+    # THEN
+    assert "does not exist" in str(raise_ctx.value)
 
 
 class TestCreateLocalQueueUserGroup:
@@ -916,12 +951,67 @@ class TestProvisionDirectories:
         agent_username: str,
     ) -> None:
         """Tests that provision_directories creates the queue persistence directory"""
+        # GIVEN
+        session_root_dir = MagicMock()
 
         # WHEN
-        win_installer.provision_directories(agent_username)
+        win_installer.provision_directories(
+            agent_username=agent_username, session_root_dir=session_root_dir
+        )
 
         # THEN
         mock_os_makedirs.assert_any_call(
             os.path.join(os.environ["PROGRAMDATA"], "Amazon", "Deadline", "Cache", "queues"),
             exist_ok=True,
         )
+
+    def test_creates_session_root_dir(
+        self,
+        mock_os_makedirs: MagicMock,
+        mock_set_windows_permissions: MagicMock,
+        agent_username: str,
+    ) -> None:
+        """Tests that provision_directories creates the session root directory"""
+        # GIVEN
+        session_root_dir = MagicMock()
+
+        # WHEN
+        win_installer.provision_directories(
+            agent_username=agent_username, session_root_dir=session_root_dir
+        )
+
+        # THEN
+        mock_os_makedirs.assert_any_call(
+            session_root_dir,
+            exist_ok=True,
+        )
+        mock_set_windows_permissions.assert_called_with(
+            path=session_root_dir,
+            user=agent_username,
+            user_permission=FileSystemPermissionEnum.FULL_CONTROL,
+            group="Administrators",
+            group_permission=FileSystemPermissionEnum.FULL_CONTROL,
+            agent_user_permission=None,
+            users_group_permission=FileSystemPermissionEnum.LIST_DIRECTORY_AND_READ,
+        )
+
+
+class TestGetEffectiveUserRights:
+    """Tests for get_effective_user_rights"""
+
+    @patch.object(win_installer, "win32api")
+    @patch.object(win_installer, "win32security")
+    @patch.object(win_installer, "win32net")
+    def test_skips_sid_with_no_rights(self, mock_win32net, mock_win32security, mock_win32api):
+        """SID with no assigned rights (ERROR_FILE_NOT_FOUND) properly returns an empty set"""
+        mock_win32security.LookupAccountName.return_value = (Mock(), None, None)
+        mock_win32net.NetUserGetLocalGroups.return_value = []
+        mock_win32security.LsaEnumerateAccountRights.side_effect = pywintypes.error(
+            winerror.ERROR_FILE_NOT_FOUND,
+            "LsaEnumerateAccountRights",
+            "Le fichier spécifié est introuvable.",
+        )
+
+        result = win_installer.get_effective_user_rights("testuser")
+
+        assert result == set()
